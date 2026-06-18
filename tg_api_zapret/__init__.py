@@ -7,6 +7,8 @@ from tg_api_zapret.sessions import (
     SessionBackend,
     StaticStringSessionBackend,
 )
+from tg_api_zapret.sdk import TgApiZapretClient
+from tg_api_zapret.version import __version__
 
 __all__ = [
     "EnvSessionBackend",
@@ -16,5 +18,6 @@ __all__ = [
     "StaticStringSessionBackend",
     "TelegramConfig",
     "TelegramLayer",
+    "TgApiZapretClient",
+    "__version__",
 ]
-

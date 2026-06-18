@@ -1,5 +1,6 @@
 import pytest
 
+from tg_api_zapret import __version__
 from tg_api_zapret.config import (
     OFFICIAL_DESKTOP_API_HASH,
     OFFICIAL_DESKTOP_API_ID,
@@ -14,6 +15,7 @@ def test_config_uses_official_desktop_defaults() -> None:
 
     assert config.api_id == OFFICIAL_DESKTOP_API_ID
     assert config.api_hash == OFFICIAL_DESKTOP_API_HASH
+    assert config.app_version == __version__
 
 
 def test_config_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -56,3 +58,51 @@ def test_app_settings_roundtrip(tmp_path) -> None:
     AppSettings(proxy_url="socks5d://127.0.0.1:1080").save(path)
 
     assert AppSettings.load(path).proxy_url == "socks5d://127.0.0.1:1080"
+
+
+def test_app_settings_client_profile_roundtrip(tmp_path) -> None:
+    path = tmp_path / "config.json"
+    settings = AppSettings.load(path)
+    custom = settings.client_profile.__class__(
+        device_model="custom-api",
+        system_version="Ubuntu",
+        app_version="custom-api",
+        lang_code="ru",
+        system_lang_code="ru-RU",
+    )
+
+    AppSettings(proxy_url=None, client_profile=custom).save(path)
+    loaded = AppSettings.load(path)
+
+    assert loaded.client_profile.device_model == "custom-api"
+    assert loaded.client_profile.system_lang_code == "ru-RU"
+
+
+def test_legacy_client_profile_app_version_migrates_to_package_version(tmp_path) -> None:
+    path = tmp_path / "config.json"
+    path.write_text(
+        """
+        {
+          "client_profile": {
+            "device_model": "tg-api-zapret",
+            "system_version": "Linux",
+            "app_version": "tg-api-zapret"
+          }
+        }
+        """,
+        encoding="utf-8",
+    )
+
+    loaded = AppSettings.load(path)
+
+    assert loaded.client_profile.app_version == __version__
+
+
+def test_app_settings_accounts_roundtrip(tmp_path) -> None:
+    path = tmp_path / "config.json"
+
+    AppSettings().with_account("work account").save(path)
+    loaded = AppSettings.load(path)
+
+    assert loaded.active_account == "work_account"
+    assert loaded.accounts == ["default", "work_account"]

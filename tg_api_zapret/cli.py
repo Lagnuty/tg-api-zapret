@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from dataclasses import replace
 from getpass import getpass
 import os
 from pathlib import Path
@@ -10,9 +11,17 @@ from typing import Sequence
 
 from telethon.errors import PasswordHashInvalidError, SessionPasswordNeededError
 
+from tg_api_zapret.api import ApiState, create_app
 from tg_api_zapret.client import TelegramLayer
-from tg_api_zapret.config import AppSettings, TelegramConfig, validate_proxy_url
+from tg_api_zapret.config import (
+    AppSettings,
+    ClientProfile,
+    TelegramConfig,
+    normalize_account_name,
+    validate_proxy_url,
+)
 from tg_api_zapret.sessions import FileSessionBackend, SQLiteSessionBackend
+from tg_api_zapret.version import __version__
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -25,9 +34,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--session-db", help="SQLite database for session storage.")
     parser.add_argument("--session-key", default="default", help="SQLite session key.")
     parser.add_argument(
+        "--account",
+        help="Account name. If omitted, the active account from config is used.",
+    )
+    parser.add_argument(
         "--config-file",
         default="~/.config/tg-api-zapret/config.json",
         help="Path for app settings such as Telegram proxy URL.",
+    )
+    parser.add_argument(
+        "--queue-backend",
+        choices=["memory", "redis"],
+        default=os.getenv("TG_API_QUEUE_BACKEND", "memory"),
+        help="Queue backend for API background jobs.",
+    )
+    parser.add_argument(
+        "--redis-url",
+        default=os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0"),
+        help="Redis URL for --queue-backend redis.",
     )
     parser.add_argument(
         "--menu",
@@ -71,6 +95,21 @@ def build_parser() -> argparse.ArgumentParser:
     dialogs = subparsers.add_parser("dialogs", help="List dialogs.")
     dialogs.add_argument("--limit", type=int, default=20)
 
+    api = subparsers.add_parser("api", help="Start HTTP API server.")
+    api.add_argument("--host", default="127.0.0.1")
+    api.add_argument("--port", type=int, default=8080)
+    api.add_argument(
+        "--queue-backend",
+        choices=["memory", "redis"],
+        default=os.getenv("TG_API_QUEUE_BACKEND", "memory"),
+        help="Queue backend for API background jobs.",
+    )
+    api.add_argument(
+        "--redis-url",
+        default=os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0"),
+        help="Redis URL for --queue-backend redis.",
+    )
+
     set_proxy = subparsers.add_parser("set-proxy", help="Save proxy settings for Telegram.")
     set_proxy.add_argument(
         "proxy_url",
@@ -81,8 +120,19 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
 
+    profile = subparsers.add_parser("set-client-profile", help="Set Telegram device name/profile.")
+    profile.add_argument("--device-model", default="tg-api-zapret")
+    profile.add_argument("--system-version", default="Linux")
+    profile.add_argument("--app-version", default=__version__)
+    profile.add_argument("--lang-code", default="en")
+    profile.add_argument("--system-lang-code", default="en-US")
+
     subparsers.add_parser("clear-proxy", help="Remove saved proxy settings.")
     subparsers.add_parser("show-config", help="Print current app settings.")
+    subparsers.add_parser("accounts", help="List known accounts.")
+
+    use_account = subparsers.add_parser("use-account", help="Switch active account.")
+    use_account.add_argument("account", help="Account name.")
 
     return parser
 
@@ -107,13 +157,31 @@ async def run(args: argparse.Namespace) -> None:
     if args.command == "set-proxy":
         proxy_url = args.proxy_url or prompt_proxy_url()
         validate_proxy_url(proxy_url)
-        AppSettings(proxy_url=proxy_url).save(settings_path)
+        replace(settings, proxy_url=proxy_url).save(settings_path)
         print(f"proxy saved: {mask_proxy_url(proxy_url)}")
     elif args.command == "clear-proxy":
-        AppSettings(proxy_url=None).save(settings_path)
+        replace(settings, proxy_url=None).save(settings_path)
         print("proxy cleared")
+    elif args.command == "set-client-profile":
+        profile = ClientProfile(
+            device_model=args.device_model,
+            system_version=args.system_version,
+            app_version=args.app_version,
+            lang_code=args.lang_code,
+            system_lang_code=args.system_lang_code,
+        )
+        replace(settings, client_profile=profile).save(settings_path)
+        print("client profile saved")
     elif args.command == "show-config":
         print_config(settings)
+    elif args.command == "accounts":
+        print_accounts(settings)
+    elif args.command == "use-account":
+        updated = settings.with_account(args.account)
+        updated.save(settings_path)
+        print(f"active account: {updated.active_account}")
+    elif args.command == "api":
+        await run_api(args)
     else:
         layer = build_layer(args, settings)
         async with layer.lifespan():
@@ -163,7 +231,10 @@ async def run_menu(args: argparse.Namespace) -> None:
         settings = AppSettings.load(settings_path)
         print()
         print("tg-api-zapret")
+        print(f"Version: {__version__}")
+        print(f"Account: {resolve_account(args, settings)}")
         print(f"Proxy: {mask_proxy_url(settings.proxy_url) if settings.proxy_url else 'not set'}")
+        print(f"Device: {settings.client_profile.device_model}")
         print("1. Start Telegram layer / login")
         print("2. Status")
         print("3. Send message")
@@ -171,6 +242,10 @@ async def run_menu(args: argparse.Namespace) -> None:
         print("5. Set proxy")
         print("6. Clear proxy")
         print("7. Show config")
+        print("8. Set client name")
+        print("9. Start HTTP API")
+        print("10. Switch/add account")
+        print("11. List accounts")
         print("0. Exit")
 
         choice = input("Choose: ").strip()
@@ -212,13 +287,29 @@ async def run_menu(args: argparse.Namespace) -> None:
             elif choice == "5":
                 proxy_url = prompt_proxy_url()
                 validate_proxy_url(proxy_url)
-                AppSettings(proxy_url=proxy_url).save(settings_path)
+                replace(settings, proxy_url=proxy_url).save(settings_path)
                 print(f"proxy saved: {mask_proxy_url(proxy_url)}")
             elif choice == "6":
-                AppSettings(proxy_url=None).save(settings_path)
+                replace(settings, proxy_url=None).save(settings_path)
                 print("proxy cleared")
             elif choice == "7":
                 print_config(settings)
+            elif choice == "8":
+                profile = prompt_client_profile(settings.client_profile)
+                replace(settings, client_profile=profile).save(settings_path)
+                print("client profile saved")
+            elif choice == "9":
+                host = input("Host [127.0.0.1]: ").strip() or "127.0.0.1"
+                port = int(input("Port [8080]: ").strip() or "8080")
+                await run_api(argparse.Namespace(**vars(args), host=host, port=port))
+            elif choice == "10":
+                account = input("Account name: ").strip()
+                updated = settings.with_account(account)
+                updated.save(settings_path)
+                args.account = updated.active_account
+                print(f"active account: {updated.active_account}")
+            elif choice == "11":
+                print_accounts(settings)
             else:
                 print("Unknown menu item")
         except RuntimeError as exc:
@@ -226,11 +317,35 @@ async def run_menu(args: argparse.Namespace) -> None:
 
 
 def build_layer(args: argparse.Namespace, settings: AppSettings) -> TelegramLayer:
+    account = resolve_account(args, settings)
     if args.session_db:
-        backend = SQLiteSessionBackend(Path(args.session_db), args.session_key)
+        backend = SQLiteSessionBackend(Path(args.session_db), account)
     else:
-        backend = FileSessionBackend(Path(args.session_file))
-    return TelegramLayer(TelegramConfig.from_env(proxy_url=settings.proxy_url), backend)
+        backend = FileSessionBackend(resolve_session_file(args.session_file, account))
+    return TelegramLayer(
+        TelegramConfig.from_env(
+            proxy_url=settings.proxy_url,
+            client_profile=settings.client_profile,
+        ),
+        backend,
+    )
+
+
+async def run_api(args: argparse.Namespace) -> None:
+    import uvicorn
+
+    state = ApiState(
+        config_file=args.config_file,
+        session_file=args.session_file,
+        session_db=args.session_db,
+        default_account=resolve_account(args, AppSettings.load(args.config_file)),
+        queue_backend=args.queue_backend,
+        redis_url=args.redis_url,
+    )
+    app = create_app(state)
+    config = uvicorn.Config(app, host=args.host, port=args.port)
+    server = uvicorn.Server(config)
+    await server.serve()
 
 
 def prompt_proxy_url() -> str:
@@ -249,6 +364,46 @@ def prompt_proxy_url() -> str:
 def print_config(settings: AppSettings) -> None:
     effective_proxy_url = settings.proxy_url or os.getenv("TELEGRAM_PROXY_URL")
     print(f"proxy_url={mask_proxy_url(effective_proxy_url) if effective_proxy_url else ''}")
+    profile = settings.client_profile
+    print(f"device_model={profile.device_model}")
+    print(f"system_version={profile.system_version}")
+    print(f"app_version={profile.app_version}")
+    print(f"lang_code={profile.lang_code}")
+    print(f"system_lang_code={profile.system_lang_code}")
+    print(f"active_account={settings.active_account}")
+    print(f"accounts={','.join(settings.accounts)}")
+
+
+def print_accounts(settings: AppSettings) -> None:
+    for account in settings.accounts:
+        marker = "*" if account == settings.active_account else " "
+        print(f"{marker} {account}")
+
+
+def resolve_account(args: argparse.Namespace, settings: AppSettings) -> str:
+    return normalize_account_name(getattr(args, "account", None) or settings.active_account)
+
+
+def resolve_session_file(session_file: str, account: str) -> Path:
+    base = Path(session_file).expanduser()
+    if account == "default":
+        return base
+    return base.parent / "sessions" / f"{account}.session.txt"
+
+
+def prompt_client_profile(current: ClientProfile) -> ClientProfile:
+    device_model = input(f"Device name [{current.device_model}]: ").strip() or current.device_model
+    system_version = input(f"System version [{current.system_version}]: ").strip()
+    app_version = input(f"App version [{current.app_version}]: ").strip()
+    lang_code = input(f"Lang code [{current.lang_code}]: ").strip()
+    system_lang_code = input(f"System lang code [{current.system_lang_code}]: ").strip()
+    return ClientProfile(
+        device_model=device_model,
+        system_version=system_version or current.system_version,
+        app_version=app_version or current.app_version,
+        lang_code=lang_code or current.lang_code,
+        system_lang_code=system_lang_code or current.system_lang_code,
+    )
 
 
 def mask_proxy_url(proxy_url: str | None) -> str:
