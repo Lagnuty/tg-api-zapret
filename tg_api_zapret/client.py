@@ -141,6 +141,9 @@ class TelegramLayer:
         self._persist_session()
         return result
 
+    async def authorized_client(self) -> TelegramClient:
+        return await self._require_authorized_client()
+
     async def stream_updates(
         self,
         handler: UpdateHandler,
@@ -176,4 +179,3 @@ class TelegramLayer:
         session_string = StringSession.save(self._client.session)
         if session_string:
             self.session_backend.save(session_string)
-

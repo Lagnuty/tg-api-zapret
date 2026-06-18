@@ -165,7 +165,7 @@ HTTP API.
 python -m tg_api_zapret set-client-profile \
   --device-model tg-api-zapret \
   --system-version Ubuntu \
-  --app-version 0.3.0
+  --app-version 0.4.0
 ```
 
 Для уже существующей сессии Telegram может оставить старое название. Надежный

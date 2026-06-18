@@ -6,6 +6,8 @@ from typing import Any
 
 
 class QueueBackend(ABC):
+    runs_inline: bool = True
+
     @abstractmethod
     async def create_job(self, job: dict[str, Any]) -> dict[str, Any]:
         raise NotImplementedError
@@ -21,6 +23,9 @@ class QueueBackend(ABC):
     @abstractmethod
     async def list_jobs(self) -> list[dict[str, Any]]:
         raise NotImplementedError
+
+    async def reserve_job(self, *, timeout: int = 5) -> dict[str, Any] | None:
+        return None
 
     async def close(self) -> None:
         return None
@@ -46,6 +51,8 @@ class MemoryQueueBackend(QueueBackend):
 
 
 class RedisQueueBackend(QueueBackend):
+    runs_inline = False
+
     def __init__(self, redis_url: str, *, prefix: str = "tg-api-zapret") -> None:
         self.redis_url = redis_url
         self.prefix = prefix
@@ -55,6 +62,7 @@ class RedisQueueBackend(QueueBackend):
         redis = await self._client()
         await redis.sadd(self._index_key(), job["id"])
         await redis.set(self._job_key(job["id"]), json.dumps(job, ensure_ascii=False))
+        await redis.rpush(self._queue_key(), job["id"])
         return job
 
     async def update_job(self, job_id: str, **fields: Any) -> dict[str, Any]:
@@ -85,6 +93,14 @@ class RedisQueueBackend(QueueBackend):
                 jobs.append(job)
         return jobs
 
+    async def reserve_job(self, *, timeout: int = 5) -> dict[str, Any] | None:
+        redis = await self._client()
+        item = await redis.blpop(self._queue_key(), timeout=timeout)
+        if item is None:
+            return None
+        _, job_id = item
+        return await self.get_job(decode_redis_value(job_id))
+
     async def close(self) -> None:
         if self._redis is not None:
             await self._redis.aclose()
@@ -103,6 +119,9 @@ class RedisQueueBackend(QueueBackend):
     def _index_key(self) -> str:
         return f"{self.prefix}:jobs"
 
+    def _queue_key(self) -> str:
+        return f"{self.prefix}:queue"
+
 
 def build_queue_backend(kind: str = "memory", *, redis_url: str | None = None) -> QueueBackend:
     if kind == "memory":
@@ -116,4 +135,3 @@ def build_queue_backend(kind: str = "memory", *, redis_url: str | None = None) -
 
 def decode_redis_value(value: str | bytes) -> str:
     return value.decode("utf-8") if isinstance(value, bytes) else value
-

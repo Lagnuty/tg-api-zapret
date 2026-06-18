@@ -103,6 +103,7 @@ class ServiceSettings:
     audit_log_path: str | None = None
     enable_raw_invoke: bool = True
     enable_layer_invoke: bool = True
+    bot_token_accounts: dict[str, str] = field(default_factory=dict)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "ServiceSettings":
@@ -129,6 +130,10 @@ class ServiceSettings:
             audit_log_path=data.get("audit_log_path") or None,
             enable_raw_invoke=bool(data.get("enable_raw_invoke", cls.enable_raw_invoke)),
             enable_layer_invoke=bool(data.get("enable_layer_invoke", cls.enable_layer_invoke)),
+            bot_token_accounts={
+                str(token): normalize_account_name(account)
+                for token, account in dict(data.get("bot_token_accounts") or {}).items()
+            },
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -149,6 +154,7 @@ class ServiceSettings:
             "audit_log_path": self.audit_log_path,
             "enable_raw_invoke": self.enable_raw_invoke,
             "enable_layer_invoke": self.enable_layer_invoke,
+            "bot_token_accounts": self.bot_token_accounts,
         }
 
 

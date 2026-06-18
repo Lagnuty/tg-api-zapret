@@ -7,8 +7,9 @@ from urllib.request import Request, urlopen
 
 
 class TgApiZapretClient:
-    def __init__(self, base_url: str = "http://127.0.0.1:8080") -> None:
+    def __init__(self, base_url: str = "http://127.0.0.1:8080", token: str | None = None) -> None:
         self.base_url = base_url.rstrip("/")
+        self.token = token
 
     def health(self) -> dict[str, Any]:
         return self._request("GET", "/health")
@@ -35,6 +36,65 @@ class TgApiZapretClient:
             "/messages/send",
             query=account_query(account),
             body={"entity": entity, "text": text, "parse_mode": parse_mode},
+        )
+
+    def send_media(
+        self,
+        entity: str | int,
+        *,
+        file_path: str | None = None,
+        file_base64: str | None = None,
+        file_name: str | None = None,
+        caption: str | None = None,
+        account: str | None = None,
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            "/media/send",
+            query=account_query(account),
+            body={
+                "entity": entity,
+                "file_path": file_path,
+                "file_base64": file_base64,
+                "file_name": file_name,
+                "caption": caption,
+            },
+        )
+
+    def resolve_entity(self, entity: str | int, *, account: str | None = None) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            "/entities/resolve",
+            query=account_query(account),
+            body={"entity": entity},
+        )
+
+    def raw_invoke(
+        self,
+        request: str,
+        kwargs: dict[str, Any] | None = None,
+        *,
+        account: str | None = None,
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            "/raw/invoke",
+            query=account_query(account),
+            body={"request": request, "kwargs": kwargs or {}},
+        )
+
+    def construct_tl(
+        self,
+        constructor: str,
+        fields: dict[str, Any] | None = None,
+        *,
+        account: str | None = None,
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            "/tl/construct",
+            query=account_query(account),
+            body={"constructor": constructor, "fields": fields or {}},
         )
 
     def rpc(
@@ -141,6 +201,8 @@ class TgApiZapretClient:
 
         data = None
         headers = {"Accept": "application/json"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
         if body is not None:
             data = json.dumps(body).encode("utf-8")
             headers["Content-Type"] = "application/json"
@@ -148,6 +210,56 @@ class TgApiZapretClient:
         request = Request(url, data=data, headers=headers, method=method)
         with urlopen(request, timeout=60) as response:
             return json.loads(response.read().decode("utf-8"))
+
+    def bot_api(self, token: str) -> "BotApiAdapter":
+        return BotApiAdapter(self.base_url, token, bearer_token=self.token)
+
+
+class BotApiAdapter:
+    def __init__(
+        self,
+        base_url: str = "http://127.0.0.1:8080",
+        bot_token: str = "",
+        *,
+        bearer_token: str | None = None,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.bot_token = bot_token
+        self.bearer_token = bearer_token
+
+    def get_me(self) -> dict[str, Any]:
+        return self._call("getMe")
+
+    def get_updates(self, **params: Any) -> dict[str, Any]:
+        return self._call("getUpdates", params)
+
+    def send_message(self, chat_id: str | int, text: str, **params: Any) -> dict[str, Any]:
+        return self._call("sendMessage", {"chat_id": chat_id, "text": text, **params})
+
+    def send_photo(self, chat_id: str | int, photo: str, **params: Any) -> dict[str, Any]:
+        return self._call("sendPhoto", {"chat_id": chat_id, "photo": photo, **params})
+
+    def send_document(self, chat_id: str | int, document: str, **params: Any) -> dict[str, Any]:
+        return self._call("sendDocument", {"chat_id": chat_id, "document": document, **params})
+
+    def edit_message_text(
+        self,
+        chat_id: str | int,
+        message_id: int,
+        text: str,
+        **params: Any,
+    ) -> dict[str, Any]:
+        return self._call(
+            "editMessageText",
+            {"chat_id": chat_id, "message_id": message_id, "text": text, **params},
+        )
+
+    def delete_message(self, chat_id: str | int, message_id: int) -> dict[str, Any]:
+        return self._call("deleteMessage", {"chat_id": chat_id, "message_id": message_id})
+
+    def _call(self, method: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+        client = TgApiZapretClient(self.base_url, token=self.bearer_token)
+        return client._request("POST", f"/bot{self.bot_token}/{method}", body=params or {})
 
 
 def account_query(account: str | None) -> dict[str, str]:

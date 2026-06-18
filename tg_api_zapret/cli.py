@@ -11,7 +11,7 @@ from typing import Sequence
 
 from telethon.errors import PasswordHashInvalidError, SessionPasswordNeededError
 
-from tg_api_zapret.api import ApiState, create_app
+from tg_api_zapret.api import ApiState, create_app, run_queue_worker
 from tg_api_zapret.client import TelegramLayer
 from tg_api_zapret.config import (
     AppSettings,
@@ -110,6 +110,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Redis URL for --queue-backend redis.",
     )
 
+    worker = subparsers.add_parser("worker", help="Run production queue worker.")
+    worker.add_argument(
+        "--queue-backend",
+        choices=["redis"],
+        default="redis",
+        help="Worker backend. Production workers use Redis.",
+    )
+    worker.add_argument(
+        "--redis-url",
+        default=os.getenv("REDIS_URL", "redis://127.0.0.1:6379/0"),
+        help="Redis URL for worker jobs.",
+    )
+    worker.add_argument("--poll-timeout", type=int, default=5)
+
     set_proxy = subparsers.add_parser("set-proxy", help="Save proxy settings for Telegram.")
     set_proxy.add_argument(
         "proxy_url",
@@ -182,6 +196,8 @@ async def run(args: argparse.Namespace) -> None:
         print(f"active account: {updated.active_account}")
     elif args.command == "api":
         await run_api(args)
+    elif args.command == "worker":
+        await run_worker(args)
     else:
         layer = build_layer(args, settings)
         async with layer.lifespan():
@@ -346,6 +362,21 @@ async def run_api(args: argparse.Namespace) -> None:
     config = uvicorn.Config(app, host=args.host, port=args.port)
     server = uvicorn.Server(config)
     await server.serve()
+
+
+async def run_worker(args: argparse.Namespace) -> None:
+    state = ApiState(
+        config_file=args.config_file,
+        session_file=args.session_file,
+        session_db=args.session_db,
+        default_account=resolve_account(args, AppSettings.load(args.config_file)),
+        queue_backend=args.queue_backend,
+        redis_url=args.redis_url,
+    )
+    try:
+        await run_queue_worker(state, poll_timeout=args.poll_timeout)
+    finally:
+        await state.disconnect()
 
 
 def prompt_proxy_url() -> str:
