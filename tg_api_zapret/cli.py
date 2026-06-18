@@ -116,7 +116,7 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="?",
         help=(
             "Proxy URL: http://host:port, https://host:port, "
-            "socks5://host:port, socks5d://host:port, socks5h://host:port."
+            "socks5://host:port, socks5h://host:port."
         ),
     )
 
@@ -349,11 +349,10 @@ async def run_api(args: argparse.Namespace) -> None:
 
 
 def prompt_proxy_url() -> str:
-    print("Supported schemes: http, https, socks5, socks5d, socks5h")
+    print("Supported schemes: http, https, socks5, socks5h")
     print("Examples:")
     print("  http://127.0.0.1:8080")
     print("  socks5://user:password@127.0.0.1:1080")
-    print("  socks5d://127.0.0.1:1080")
     print("  socks5h://127.0.0.1:1080")
     proxy_url = input("Proxy URL: ").strip()
     if not proxy_url:

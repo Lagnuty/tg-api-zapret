@@ -212,8 +212,8 @@ class AppSettings:
 def parse_proxy_url(proxy_url: str) -> tuple[Any, ...]:
     parsed = validate_proxy_url(proxy_url)
     scheme = parsed.scheme.lower()
-    proxy_type = "http" if scheme == "https" else "socks5" if scheme in {"socks5d", "socks5h"} else scheme
-    rdns = scheme in {"https", "socks5d", "socks5h"}
+    proxy_type = "http" if scheme == "https" else "socks5" if scheme == "socks5h" else scheme
+    rdns = scheme in {"https", "socks5h"}
 
     return (
         proxy_type,
@@ -228,8 +228,8 @@ def parse_proxy_url(proxy_url: str) -> tuple[Any, ...]:
 def validate_proxy_url(proxy_url: str):
     parsed = urlparse(proxy_url)
     scheme = parsed.scheme.lower()
-    if scheme not in {"http", "https", "socks5", "socks5d", "socks5h"}:
-        raise ValueError("Proxy URL must use http, https, socks5, socks5d, or socks5h scheme")
+    if scheme not in {"http", "https", "socks5", "socks5h"}:
+        raise ValueError("Proxy URL must use http, https, socks5, or socks5h scheme")
     if not parsed.hostname or not parsed.port:
         raise ValueError("Proxy URL must include host and port")
     return parsed

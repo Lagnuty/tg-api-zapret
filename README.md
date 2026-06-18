@@ -165,7 +165,7 @@ HTTP API.
 python -m tg_api_zapret set-client-profile \
   --device-model tg-api-zapret \
   --system-version Ubuntu \
-  --app-version 0.2.9
+  --app-version 0.3.0
 ```
 
 Для уже существующей сессии Telegram может оставить старое название. Надежный
@@ -180,7 +180,7 @@ python -m tg_api_zapret set-client-profile \
 Прокси можно сохранить в конфиге приложения:
 
 ```bash
-python -m tg_api_zapret set-proxy socks5d://127.0.0.1:1080
+python -m tg_api_zapret set-proxy socks5h://127.0.0.1:1080
 ```
 
 Поддерживаемые схемы:
@@ -188,13 +188,11 @@ python -m tg_api_zapret set-proxy socks5d://127.0.0.1:1080
 - `http://host:port`
 - `https://host:port`
 - `socks5://host:port`
-- `socks5d://host:port`
 - `socks5h://host:port`
 - `socks5://user:password@host:port`
-- `socks5d://user:password@host:port`
 - `socks5h://user:password@host:port`
 
-`socks5d` и `socks5h` включают разрешение доменов через прокси. `socks5`
+`socks5h` включает разрешение доменов через прокси. `socks5`
 оставляет DNS на стороне машины, где запущена программа.
 
 Посмотреть текущую настройку:
@@ -287,8 +285,8 @@ curl -X POST 'http://127.0.0.1:8080/messages/send?account=personal' \
 - `docs/mtproto-definitions.json`
 - `docs/mtproto-importance-layers.md`
 - `docs/mtproto-importance-layers.json`
-- `docs/implemented-layer-1-functions.md`
-- `docs/implemented-layer-1-functions.json`
+- `docs/implemented-mtproto-layer-functions.md`
+- `docs/implemented-mtproto-layer-functions.json`
 
 В Telethon `1.44.0` сейчас получается `2344` definitions:
 
@@ -308,10 +306,11 @@ python scripts/generate_mtproto_importance_layers.py
 python scripts/generate_implemented_layer_report.py
 ```
 
-Layer 1 request-функции реализованы через ограниченный dispatcher:
+Request-функции всех уровней 1-10 реализованы через ограниченный dispatcher:
 
 ```bash
 curl http://127.0.0.1:8080/mtproto/layers/1/functions
+curl http://127.0.0.1:8080/mtproto/layers/10/functions
 
 curl -X POST 'http://127.0.0.1:8080/mtproto/layers/1/invoke?account=work' \
   -H 'Content-Type: application/json' \
