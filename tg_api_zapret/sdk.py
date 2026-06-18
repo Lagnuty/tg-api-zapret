@@ -69,6 +69,12 @@ class TgApiZapretClient:
     def capabilities(self) -> dict[str, Any]:
         return self._request("GET", "/capabilities")
 
+    def app_settings(self) -> dict[str, Any]:
+        return self._request("GET", "/app/settings")
+
+    def update_app_settings(self, **settings: Any) -> dict[str, Any]:
+        return self._request("PATCH", "/app/settings", body=settings)
+
     def resolve_action(
         self,
         task: str,

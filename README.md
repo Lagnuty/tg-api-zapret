@@ -165,7 +165,7 @@ HTTP API.
 python -m tg_api_zapret set-client-profile \
   --device-model tg-api-zapret \
   --system-version Ubuntu \
-  --app-version 0.2.6
+  --app-version 0.2.9
 ```
 
 Для уже существующей сессии Telegram может оставить старое название. Надежный
@@ -246,6 +246,8 @@ http://127.0.0.1:8080/docs
 - `POST /messages/delete`
 - `POST /messages/forward`
 - `POST /raw/invoke`
+- `GET /mtproto/layers/{layer}/functions`
+- `POST /mtproto/layers/{layer}/invoke`
 - `POST /rpc`
 - `GET /events`
 - `WS /ws/updates`
@@ -255,6 +257,9 @@ http://127.0.0.1:8080/docs
 - `GET /capabilities`
 - `POST /actions/resolve`
 - `POST /actions/execute`
+- `GET /app/settings`
+- `PUT /app/settings`
+- `PATCH /app/settings`
 
 Пример отправки сообщения:
 
@@ -282,6 +287,8 @@ curl -X POST 'http://127.0.0.1:8080/messages/send?account=personal' \
 - `docs/mtproto-definitions.json`
 - `docs/mtproto-importance-layers.md`
 - `docs/mtproto-importance-layers.json`
+- `docs/implemented-layer-1-functions.md`
+- `docs/implemented-layer-1-functions.json`
 
 В Telethon `1.44.0` сейчас получается `2344` definitions:
 
@@ -298,6 +305,17 @@ curl -X POST 'http://127.0.0.1:8080/messages/send?account=personal' \
 ```bash
 python scripts/generate_mtproto_docs.py
 python scripts/generate_mtproto_importance_layers.py
+python scripts/generate_implemented_layer_report.py
+```
+
+Layer 1 request-функции реализованы через ограниченный dispatcher:
+
+```bash
+curl http://127.0.0.1:8080/mtproto/layers/1/functions
+
+curl -X POST 'http://127.0.0.1:8080/mtproto/layers/1/invoke?account=work' \
+  -H 'Content-Type: application/json' \
+  -d '{"request":"updates.GetStateRequest","kwargs":{}}'
 ```
 
 ## Automatic API Method Selection
@@ -365,6 +383,91 @@ print(result)
 ```bash
 curl http://127.0.0.1:8080/capabilities
 ```
+
+## Application Settings API
+
+Настройки самого сервиса:
+
+```bash
+curl http://127.0.0.1:8080/app/settings
+```
+
+Изменить часть настроек:
+
+```bash
+curl -X PATCH http://127.0.0.1:8080/app/settings \
+  -H 'Content-Type: application/json' \
+  -d '{"default_api_interface":"json_rpc","stream_queue_size":250,"enabled_interfaces":["rest","json_rpc","queue","sse","websocket","python_sdk"]}'
+```
+
+Доступные настройки:
+
+- `api_name` - имя сервиса.
+- `public_base_url` - внешний URL сервиса, если есть reverse proxy.
+- `default_api_interface` - интерфейс по умолчанию для `/actions/resolve`.
+- `enabled_interfaces` - включенные интерфейсы: `rest`, `json_rpc`, `websocket`, `sse`, `queue`, `python_sdk`.
+- `max_queue_jobs_list` - лимит выдачи списка задач для будущих backend-реализаций.
+- `stream_queue_size` - размер буфера событий WebSocket/SSE.
+- `request_timeout_seconds` - общий timeout для будущих долгих операций.
+- `expose_docs` - флаг показа документации для будущего middleware.
+- `cors_origins` - разрешенные origins для будущего CORS middleware.
+- `require_api_token` и `api_token_env` - флаги авторизации API для будущего middleware.
+
+В Python SDK:
+
+```python
+from tg_api_zapret import TgApiZapretClient
+
+client = TgApiZapretClient()
+print(client.app_settings())
+client.update_app_settings(default_api_interface="json_rpc", stream_queue_size=250)
+```
+
+## Security Settings
+
+Production-режим с токенами, scopes, audit log и отключенными опасными вызовами:
+
+```bash
+export TG_API_TOKEN='dev-admin-token'
+export TG_API_TOKENS='{"work-token":["work"],"admin-token":["*"]}'
+
+curl -X PATCH http://127.0.0.1:8080/app/settings \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "require_api_token": true,
+    "api_token_env": "TG_API_TOKEN",
+    "api_tokens_env": "TG_API_TOKENS",
+    "rate_limit_per_minute": 120,
+    "audit_log_path": "~/.config/tg-api-zapret/audit.jsonl",
+    "enable_raw_invoke": false,
+    "enable_layer_invoke": false,
+    "expose_docs": false
+  }'
+```
+
+Запросы после этого:
+
+```bash
+curl http://127.0.0.1:8080/dialogs?account=work \
+  -H 'Authorization: Bearer work-token'
+```
+
+Scopes:
+
+- `["work"]` - токен видит и использует только аккаунт `work`.
+- `["personal","work"]` - доступ к двум аккаунтам.
+- `["*"]` - полный доступ.
+
+Опасные возможности не удалены. Их можно включить обратно:
+
+```bash
+curl -X PATCH http://127.0.0.1:8080/app/settings \
+  -H 'Authorization: Bearer admin-token' \
+  -H 'Content-Type: application/json' \
+  -d '{"enable_raw_invoke":true,"enable_layer_invoke":true}'
+```
+
+Audit log пишет JSONL без body, кодов, паролей, session strings и proxy password.
 
 ## WebSocket API
 

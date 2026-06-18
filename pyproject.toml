@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tg-api-zapret"
-version = "0.2.6"
+version = "0.2.9"
 description = "Async Telegram MTProto wrapper with reusable session storage."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -21,6 +21,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  "httpx>=0.27",
   "pytest>=8.0",
   "pytest-asyncio>=0.24",
   "ruff>=0.8",

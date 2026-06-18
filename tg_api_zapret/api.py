@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
 from dataclasses import replace
+import hashlib
 import importlib
 import json
+import os
 from pathlib import Path
+import time
 from typing import Any
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
 from telethon import events
@@ -22,13 +27,17 @@ from tg_api_zapret.client import SentCode, TelegramLayer
 from tg_api_zapret.config import (
     AppSettings,
     ClientProfile,
+    ServiceSettings,
     TelegramConfig,
     normalize_account_name,
     validate_proxy_url,
 )
+from tg_api_zapret.mtproto_layers import get_layer_functions, require_layer_function
 from tg_api_zapret.queue_backends import QueueBackend, build_queue_backend
 from tg_api_zapret.sessions import FileSessionBackend, SQLiteSessionBackend
 from tg_api_zapret.version import __version__
+
+REQUEST_SCOPES: ContextVar[list[str] | None] = ContextVar("REQUEST_SCOPES", default=None)
 
 
 class ApiState:
@@ -48,6 +57,7 @@ class ApiState:
         self.default_account = normalize_account_name(default_account)
         self.layers: dict[str, TelegramLayer] = {}
         self.queue: QueueBackend = build_queue_backend(queue_backend, redis_url=redis_url)
+        self.rate_limits: dict[str, list[float]] = {}
 
     def settings(self) -> AppSettings:
         return AppSettings.load(self.config_file)
@@ -113,6 +123,27 @@ class ClientProfilePayload(BaseModel):
     system_lang_code: str = Field(default="en-US", min_length=1)
 
 
+class ServiceSettingsPayload(BaseModel):
+    api_name: str = "tg-api-zapret"
+    public_base_url: str | None = None
+    default_api_interface: str = "rest"
+    enabled_interfaces: list[str] = Field(
+        default_factory=lambda: ["rest", "json_rpc", "websocket", "sse", "queue", "python_sdk"]
+    )
+    max_queue_jobs_list: int = Field(default=1000, ge=1)
+    stream_queue_size: int = Field(default=100, ge=1)
+    request_timeout_seconds: int = Field(default=60, ge=1)
+    expose_docs: bool = True
+    cors_origins: list[str] = Field(default_factory=list)
+    require_api_token: bool = False
+    api_token_env: str = "TG_API_TOKEN"
+    api_tokens_env: str = "TG_API_TOKENS"
+    rate_limit_per_minute: int = Field(default=120, ge=0)
+    audit_log_path: str | None = None
+    enable_raw_invoke: bool = True
+    enable_layer_invoke: bool = True
+
+
 class SendCodePayload(BaseModel):
     phone: str
 
@@ -158,6 +189,13 @@ class RawInvokePayload(BaseModel):
     kwargs: dict[str, Any] = Field(default_factory=dict)
 
 
+class MtprotoLayerInvokePayload(BaseModel):
+    request: str = Field(
+        description="Layer function callable path, for example messages.SendMessageRequest"
+    )
+    kwargs: dict[str, Any] = Field(default_factory=dict)
+
+
 class JsonRpcRequest(BaseModel):
     jsonrpc: str = "2.0"
     method: str
@@ -195,6 +233,38 @@ def create_app(state: ApiState) -> FastAPI:
 
     app = FastAPI(title="tg-api-zapret", version=__version__, lifespan=lifespan)
 
+    @app.middleware("http")
+    async def security_middleware(request: Request, call_next):
+        service = state.settings().service
+        if not service.expose_docs and request.url.path in {"/docs", "/redoc", "/openapi.json"}:
+            return JSONResponse({"detail": "Documentation is disabled"}, status_code=404)
+
+        token = extract_bearer_token(request.headers.get("authorization"))
+        scopes = token_scopes(service, token)
+        if service.require_api_token and scopes is None and request.url.path != "/health":
+            await audit_request(state, request, 401, token)
+            return JSONResponse({"detail": "Missing or invalid API token"}, status_code=401)
+        scope_token = REQUEST_SCOPES.set(scopes)
+
+        rate_key = token_hash(token) if token else request.client.host if request.client else "unknown"
+        if not check_rate_limit(state, rate_key, service.rate_limit_per_minute):
+            await audit_request(state, request, 429, token)
+            REQUEST_SCOPES.reset(scope_token)
+            return JSONResponse({"detail": "Rate limit exceeded"}, status_code=429)
+
+        account = request.query_params.get("account")
+        if scopes is not None and account and not account_allowed(scopes, account):
+            await audit_request(state, request, 403, token)
+            REQUEST_SCOPES.reset(scope_token)
+            return JSONResponse({"detail": "Account is not allowed for this token"}, status_code=403)
+
+        try:
+            response = await call_next(request)
+            await audit_request(state, request, response.status_code, token)
+            return response
+        finally:
+            REQUEST_SCOPES.reset(scope_token)
+
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}
@@ -212,6 +282,8 @@ def create_app(state: ApiState) -> FastAPI:
                         "POST /messages/delete",
                         "POST /messages/forward",
                         "POST /raw/invoke",
+                        "GET /mtproto/layers/{layer}/functions",
+                        "POST /mtproto/layers/{layer}/invoke",
                     ],
                 },
                 "json_rpc": {
@@ -236,16 +308,18 @@ def create_app(state: ApiState) -> FastAPI:
                     "class": "tg_api_zapret.TgApiZapretClient",
                 },
             },
+            "service_settings": state.settings().service.to_dict(),
             "actions": ACTIONS,
         }
 
     @app.post("/actions/resolve")
     async def resolve_action(payload: ActionResolvePayload) -> dict[str, Any]:
-        return resolve_api_method(payload)
+        return resolve_api_method(payload, state.settings().service)
 
     @app.post("/actions/execute")
     async def execute_action(payload: ActionExecutePayload) -> dict[str, Any]:
-        plan = resolve_api_method(payload)
+        ensure_account_allowed_for_payload(state, payload.account)
+        plan = resolve_api_method(payload, state.settings().service)
         if plan["interface"] == "queue":
             queue_payload = QueueJobPayload(
                 kind=plan["rpc_method"],
@@ -274,8 +348,11 @@ def create_app(state: ApiState) -> FastAPI:
 
     @app.websocket("/ws/updates")
     async def websocket_updates(websocket: WebSocket, account: str | None = None) -> None:
+        await ensure_websocket_allowed(state, websocket, account)
         await websocket.accept()
-        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=100)
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(
+            maxsize=state.settings().service.stream_queue_size
+        )
         client = await require_authorized_client(state, account)
 
         async def handler(event: events.NewMessage.Event) -> None:
@@ -298,7 +375,9 @@ def create_app(state: ApiState) -> FastAPI:
 
     @app.get("/events")
     async def sse_events(account: str | None = None) -> StreamingResponse:
-        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=100)
+        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(
+            maxsize=state.settings().service.stream_queue_size
+        )
         client = await require_authorized_client(state, account)
 
         async def handler(event: events.NewMessage.Event) -> None:
@@ -325,16 +404,36 @@ def create_app(state: ApiState) -> FastAPI:
     async def get_config() -> dict[str, Any]:
         settings = state.settings()
         return {
-            "proxy_url": settings.proxy_url,
+            "proxy_url": mask_url_secret(settings.proxy_url),
             "client_profile": settings.client_profile.to_dict(),
+            "service": settings.service.to_dict(),
             "active_account": settings.active_account,
             "accounts": settings.accounts,
         }
 
+    @app.get("/app/settings")
+    async def get_app_settings() -> dict[str, Any]:
+        return state.settings().service.to_dict()
+
+    @app.put("/app/settings")
+    async def set_app_settings(payload: ServiceSettingsPayload) -> dict[str, Any]:
+        service = ServiceSettings.from_dict(payload.model_dump())
+        settings = state.settings()
+        state.save_settings(replace(settings, service=service))
+        return service.to_dict()
+
+    @app.patch("/app/settings")
+    async def patch_app_settings(payload: dict[str, Any]) -> dict[str, Any]:
+        current = state.settings()
+        merged = {**current.service.to_dict(), **payload}
+        service = ServiceSettings.from_dict(merged)
+        state.save_settings(replace(current, service=service))
+        return service.to_dict()
+
     @app.get("/accounts")
     async def accounts() -> dict[str, Any]:
         settings = state.settings()
-        return {"active_account": settings.active_account, "accounts": settings.accounts}
+        return visible_accounts_response(settings, REQUEST_SCOPES.get())
 
     @app.post("/accounts")
     async def add_account(payload: AccountPayload) -> dict[str, Any]:
@@ -349,7 +448,7 @@ def create_app(state: ApiState) -> FastAPI:
         settings = state.settings()
         state.save_settings(replace(settings, proxy_url=payload.proxy_url))
         await reconnect(state)
-        return {"proxy_url": payload.proxy_url}
+        return {"proxy_url": mask_url_secret(payload.proxy_url)}
 
     @app.put("/config/client-profile")
     async def set_client_profile(payload: ClientProfilePayload) -> dict[str, Any]:
@@ -465,10 +564,40 @@ def create_app(state: ApiState) -> FastAPI:
 
     @app.post("/raw/invoke")
     async def raw_invoke(payload: RawInvokePayload, account: str | None = None) -> dict[str, Any]:
+        ensure_raw_enabled(state)
         layer = await state.require_layer(account)
         request_cls = resolve_tl_request(payload.request)
         result = await layer.invoke(request_cls(**payload.kwargs))
         return {"type": type(result).__name__, "result": stringify(result)}
+
+    @app.get("/mtproto/layers/{layer}/functions")
+    async def mtproto_layer_functions(layer: int) -> dict[str, Any]:
+        try:
+            functions = get_layer_functions(layer)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"layer": layer, "function_count": len(functions), "functions": functions}
+
+    @app.post("/mtproto/layers/{layer}/invoke")
+    async def mtproto_layer_invoke(
+        layer: int,
+        payload: MtprotoLayerInvokePayload,
+        account: str | None = None,
+    ) -> dict[str, Any]:
+        ensure_layer_enabled(state)
+        try:
+            require_layer_function(layer, payload.request)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        telegram_layer = await state.require_layer(account)
+        request_cls = resolve_tl_request(payload.request)
+        result = await telegram_layer.invoke(request_cls(**payload.kwargs))
+        return {
+            "layer": layer,
+            "request": payload.request,
+            "type": type(result).__name__,
+            "result": stringify(result),
+        }
 
     @app.post("/rpc")
     async def json_rpc(payload: JsonRpcRequest) -> dict[str, Any]:
@@ -484,6 +613,7 @@ def create_app(state: ApiState) -> FastAPI:
 
     @app.post("/queue/jobs")
     async def enqueue_job(payload: QueueJobPayload) -> dict[str, Any]:
+        ensure_account_allowed_for_payload(state, payload.account)
         job_id = uuid4().hex
         job = await state.queue.create_job({
             "id": job_id,
@@ -514,6 +644,135 @@ async def reconnect(state: ApiState) -> None:
     await state.disconnect()
 
 
+def extract_bearer_token(header: str | None) -> str | None:
+    if not header:
+        return None
+    scheme, _, token = header.partition(" ")
+    if scheme.lower() != "bearer" or not token:
+        return None
+    return token.strip()
+
+
+def token_scopes(service: ServiceSettings, token: str | None) -> list[str] | None:
+    if not token:
+        return None
+    tokens_json = os.getenv(service.api_tokens_env)
+    if tokens_json:
+        try:
+            tokens = json.loads(tokens_json)
+        except json.JSONDecodeError:
+            tokens = {}
+        scopes = tokens.get(token)
+        if isinstance(scopes, list):
+            return [str(scope) for scope in scopes]
+    single_token = os.getenv(service.api_token_env)
+    if single_token and token == single_token:
+        return ["*"]
+    return None
+
+
+def check_rate_limit(state: ApiState, key: str, limit_per_minute: int) -> bool:
+    if limit_per_minute <= 0:
+        return True
+    now = time.time()
+    window_start = now - 60
+    timestamps = [item for item in state.rate_limits.get(key, []) if item >= window_start]
+    if len(timestamps) >= limit_per_minute:
+        state.rate_limits[key] = timestamps
+        return False
+    timestamps.append(now)
+    state.rate_limits[key] = timestamps
+    return True
+
+
+async def audit_request(
+    state: ApiState,
+    request: Request,
+    status_code: int,
+    token: str | None,
+) -> None:
+    path = state.settings().service.audit_log_path
+    if not path:
+        return
+    audit_path = Path(path).expanduser()
+    audit_path.parent.mkdir(parents=True, exist_ok=True)
+    entry = {
+        "ts": int(time.time()),
+        "method": request.method,
+        "path": request.url.path,
+        "status_code": status_code,
+        "client": request.client.host if request.client else None,
+        "account": request.query_params.get("account"),
+        "token": token_hash(token) if token else None,
+    }
+    with audit_path.open("a", encoding="utf-8") as audit_file:
+        audit_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def token_hash(token: str | None) -> str:
+    if not token:
+        return ""
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+
+
+def account_allowed(scopes: list[str], account: str | None) -> bool:
+    if not account or "*" in scopes:
+        return True
+    return normalize_account_name(account) in {normalize_account_name(scope) for scope in scopes}
+
+
+def ensure_account_allowed_for_payload(state: ApiState, account: str | None) -> None:
+    scopes = REQUEST_SCOPES.get()
+    if scopes is not None and not account_allowed(scopes, account or state.settings().active_account):
+        raise HTTPException(status_code=403, detail="Account is not allowed for this token")
+
+
+async def ensure_websocket_allowed(
+    state: ApiState,
+    websocket: WebSocket,
+    account: str | None,
+) -> None:
+    service = state.settings().service
+    token = websocket.query_params.get("token") or extract_bearer_token(
+        websocket.headers.get("authorization")
+    )
+    scopes = token_scopes(service, token)
+    if service.require_api_token and scopes is None:
+        await websocket.close(code=1008, reason="Missing or invalid API token")
+        raise WebSocketDisconnect
+    if scopes is not None and not account_allowed(scopes, account or state.settings().active_account):
+        await websocket.close(code=1008, reason="Account is not allowed for this token")
+        raise WebSocketDisconnect
+
+
+def ensure_raw_enabled(state: ApiState) -> None:
+    if not state.settings().service.enable_raw_invoke:
+        raise HTTPException(status_code=403, detail="Raw invoke is disabled")
+
+
+def ensure_layer_enabled(state: ApiState) -> None:
+    if not state.settings().service.enable_layer_invoke:
+        raise HTTPException(status_code=403, detail="Layer invoke is disabled")
+
+
+def mask_url_secret(url: str | None) -> str | None:
+    if not url or "@" not in url or "://" not in url:
+        return url
+    scheme, rest = url.split("://", 1)
+    auth, address = rest.rsplit("@", 1)
+    username = auth.split(":", 1)[0]
+    return f"{scheme}://{username}:***@{address}"
+
+
+def visible_accounts_response(settings: AppSettings, scopes: list[str] | None) -> dict[str, Any]:
+    if scopes is None or "*" in scopes:
+        return {"active_account": settings.active_account, "accounts": settings.accounts}
+    allowed = {normalize_account_name(scope) for scope in scopes}
+    accounts = [account for account in settings.accounts if account in allowed]
+    active = settings.active_account if settings.active_account in accounts else accounts[0] if accounts else None
+    return {"active_account": active, "accounts": accounts}
+
+
 async def require_authorized_client(state: ApiState, account: str | None = None):
     layer = await state.require_layer(account)
     return await layer._require_authorized_client()
@@ -521,9 +780,10 @@ async def require_authorized_client(state: ApiState, account: str | None = None)
 
 async def dispatch_rpc(state: ApiState, method: str, params: dict[str, Any]) -> Any:
     account = params.pop("account", None)
+    ensure_account_allowed_for_payload(state, account)
     if method == "accounts.list":
         settings = state.settings()
-        return {"active_account": settings.active_account, "accounts": settings.accounts}
+        return visible_accounts_response(settings, REQUEST_SCOPES.get())
     if method == "auth.status":
         layer = await state.require_layer(account)
         return {"account": state.resolve_account(account), "authorized": await layer.is_authorized()}
@@ -542,6 +802,7 @@ async def dispatch_rpc(state: ApiState, method: str, params: dict[str, Any]) -> 
         )
         return serialize_message(message)
     if method == "raw.invoke":
+        ensure_raw_enabled(state)
         layer = await state.require_layer(account)
         request_cls = resolve_tl_request(params["request"])
         result = await layer.invoke(request_cls(**params.get("kwargs", {})))
@@ -618,10 +879,13 @@ ACTIONS: dict[str, dict[str, Any]] = {
 }
 
 
-def resolve_api_method(payload: ActionResolvePayload) -> dict[str, Any]:
+def resolve_api_method(
+    payload: ActionResolvePayload,
+    service: ServiceSettings | None = None,
+) -> dict[str, Any]:
     action_name = find_action(payload.task)
     action = ACTIONS[action_name]
-    interface = choose_interface(payload, action)
+    interface = choose_interface(payload, action, service or ServiceSettings())
     return {
         "action": action_name,
         "interface": interface,
@@ -645,17 +909,28 @@ def find_action(task: str) -> str:
     return "raw_invoke"
 
 
-def choose_interface(payload: ActionResolvePayload, action: dict[str, Any]) -> str:
+def choose_interface(
+    payload: ActionResolvePayload,
+    action: dict[str, Any],
+    service: ServiceSettings,
+) -> str:
     language = (payload.client_language or "").lower()
     if language == "python":
-        return "python_sdk"
+        return first_enabled(["python_sdk", service.default_api_interface, "rest"], service)
     if payload.background:
-        return "queue"
+        return first_enabled(["queue", "json_rpc", "rest"], service)
     if payload.realtime and payload.bidirectional:
-        return "websocket"
+        return first_enabled(["websocket", "sse"], service)
     if payload.realtime:
-        return "sse"
-    return action["interface"]
+        return first_enabled(["sse", "websocket"], service)
+    return first_enabled([service.default_api_interface, action["interface"], "rest"], service)
+
+
+def first_enabled(candidates: list[str], service: ServiceSettings) -> str:
+    for candidate in candidates:
+        if candidate in service.enabled_interfaces:
+            return candidate
+    return service.enabled_interfaces[0]
 
 
 def endpoint_for_interface(interface: str, action: dict[str, Any]) -> str:

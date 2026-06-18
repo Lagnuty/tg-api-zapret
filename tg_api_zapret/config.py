@@ -84,9 +84,79 @@ class ClientProfile:
 
 
 @dataclass(frozen=True)
+class ServiceSettings:
+    api_name: str = "tg-api-zapret"
+    public_base_url: str | None = None
+    default_api_interface: str = "rest"
+    enabled_interfaces: list[str] = field(
+        default_factory=lambda: ["rest", "json_rpc", "websocket", "sse", "queue", "python_sdk"]
+    )
+    max_queue_jobs_list: int = 1000
+    stream_queue_size: int = 100
+    request_timeout_seconds: int = 60
+    expose_docs: bool = True
+    cors_origins: list[str] = field(default_factory=list)
+    require_api_token: bool = False
+    api_token_env: str = "TG_API_TOKEN"
+    api_tokens_env: str = "TG_API_TOKENS"
+    rate_limit_per_minute: int = 120
+    audit_log_path: str | None = None
+    enable_raw_invoke: bool = True
+    enable_layer_invoke: bool = True
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "ServiceSettings":
+        if not data:
+            return cls()
+        return cls(
+            api_name=data.get("api_name") or cls.api_name,
+            public_base_url=data.get("public_base_url") or None,
+            default_api_interface=data.get("default_api_interface") or cls.default_api_interface,
+            enabled_interfaces=normalize_interfaces(data.get("enabled_interfaces")),
+            max_queue_jobs_list=int(data.get("max_queue_jobs_list", cls.max_queue_jobs_list)),
+            stream_queue_size=int(data.get("stream_queue_size", cls.stream_queue_size)),
+            request_timeout_seconds=int(
+                data.get("request_timeout_seconds", cls.request_timeout_seconds)
+            ),
+            expose_docs=bool(data.get("expose_docs", cls.expose_docs)),
+            cors_origins=list(data.get("cors_origins") or []),
+            require_api_token=bool(data.get("require_api_token", cls.require_api_token)),
+            api_token_env=data.get("api_token_env") or cls.api_token_env,
+            api_tokens_env=data.get("api_tokens_env") or cls.api_tokens_env,
+            rate_limit_per_minute=int(
+                data.get("rate_limit_per_minute", cls.rate_limit_per_minute)
+            ),
+            audit_log_path=data.get("audit_log_path") or None,
+            enable_raw_invoke=bool(data.get("enable_raw_invoke", cls.enable_raw_invoke)),
+            enable_layer_invoke=bool(data.get("enable_layer_invoke", cls.enable_layer_invoke)),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "api_name": self.api_name,
+            "public_base_url": self.public_base_url,
+            "default_api_interface": self.default_api_interface,
+            "enabled_interfaces": self.enabled_interfaces,
+            "max_queue_jobs_list": self.max_queue_jobs_list,
+            "stream_queue_size": self.stream_queue_size,
+            "request_timeout_seconds": self.request_timeout_seconds,
+            "expose_docs": self.expose_docs,
+            "cors_origins": self.cors_origins,
+            "require_api_token": self.require_api_token,
+            "api_token_env": self.api_token_env,
+            "api_tokens_env": self.api_tokens_env,
+            "rate_limit_per_minute": self.rate_limit_per_minute,
+            "audit_log_path": self.audit_log_path,
+            "enable_raw_invoke": self.enable_raw_invoke,
+            "enable_layer_invoke": self.enable_layer_invoke,
+        }
+
+
+@dataclass(frozen=True)
 class AppSettings:
     proxy_url: str | None = None
     client_profile: ClientProfile = field(default_factory=ClientProfile)
+    service: ServiceSettings = field(default_factory=ServiceSettings)
     active_account: str = "default"
     accounts: list[str] = field(default_factory=lambda: ["default"])
 
@@ -99,6 +169,7 @@ class AppSettings:
         return cls(
             proxy_url=data.get("proxy_url") or None,
             client_profile=ClientProfile.from_dict(data.get("client_profile")),
+            service=ServiceSettings.from_dict(data.get("service")),
             active_account=data.get("active_account") or "default",
             accounts=normalize_accounts(data.get("accounts")),
         )
@@ -111,6 +182,7 @@ class AppSettings:
                 {
                     "proxy_url": self.proxy_url,
                     "client_profile": self.client_profile.to_dict(),
+                    "service": self.service.to_dict(),
                     "active_account": self.active_account,
                     "accounts": normalize_accounts(self.accounts),
                 },
@@ -131,6 +203,7 @@ class AppSettings:
         return AppSettings(
             proxy_url=self.proxy_url,
             client_profile=self.client_profile,
+            service=self.service,
             active_account=account_name,
             accounts=accounts,
         )
@@ -188,3 +261,12 @@ def normalize_app_version(app_version: str | None) -> str:
     if not app_version or app_version == "tg-api-zapret":
         return __version__
     return app_version
+
+
+def normalize_interfaces(interfaces: list[str] | None) -> list[str]:
+    allowed = {"rest", "json_rpc", "websocket", "sse", "queue", "python_sdk"}
+    values = []
+    for interface in interfaces or ["rest", "json_rpc", "websocket", "sse", "queue", "python_sdk"]:
+        if interface in allowed and interface not in values:
+            values.append(interface)
+    return values or ["rest"]
