@@ -71,15 +71,16 @@ class AppSettings:
 
 
 def parse_proxy_url(proxy_url: str) -> tuple[Any, ...]:
-    parsed = urlparse(proxy_url)
+    parsed = validate_proxy_url(proxy_url)
     scheme = parsed.scheme.lower()
-    if scheme not in {"http", "https", "socks5", "socks5d", "socks5h"}:
-        raise ValueError("Proxy URL must use http, https, socks5, socks5d, or socks5h scheme")
 
     try:
         import socks
     except ImportError as exc:  # pragma: no cover - dependency is declared.
-        raise RuntimeError("PySocks is required for proxy support") from exc
+        raise RuntimeError(
+            "PySocks is required for proxy support. Install dependencies with: "
+            'python -m pip install -e "." or python -m pip install -r requirements.txt'
+        ) from exc
 
     proxy_type = {
         "http": socks.HTTP,
@@ -88,9 +89,6 @@ def parse_proxy_url(proxy_url: str) -> tuple[Any, ...]:
         "socks5d": socks.SOCKS5,
         "socks5h": socks.SOCKS5,
     }[scheme]
-    if not parsed.hostname or not parsed.port:
-        raise ValueError("Proxy URL must include host and port")
-
     rdns = scheme in {"https", "socks5d", "socks5h"}
 
     return (
@@ -101,3 +99,13 @@ def parse_proxy_url(proxy_url: str) -> tuple[Any, ...]:
         parsed.username,
         parsed.password,
     )
+
+
+def validate_proxy_url(proxy_url: str):
+    parsed = urlparse(proxy_url)
+    scheme = parsed.scheme.lower()
+    if scheme not in {"http", "https", "socks5", "socks5d", "socks5h"}:
+        raise ValueError("Proxy URL must use http, https, socks5, socks5d, or socks5h scheme")
+    if not parsed.hostname or not parsed.port:
+        raise ValueError("Proxy URL must include host and port")
+    return parsed

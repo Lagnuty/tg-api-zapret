@@ -23,6 +23,12 @@ python -m pip install -U pip
 python -m pip install -e ".[dev]"
 ```
 
+Если проект запускается прямо из папки без установки пакета, поставьте runtime-зависимости:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
 ## Переменные окружения
 
 ```bash

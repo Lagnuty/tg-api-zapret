@@ -11,7 +11,7 @@ from typing import Sequence
 from telethon.errors import SessionPasswordNeededError
 
 from tg_api_zapret.client import TelegramLayer
-from tg_api_zapret.config import AppSettings, TelegramConfig, parse_proxy_url
+from tg_api_zapret.config import AppSettings, TelegramConfig, validate_proxy_url
 from tg_api_zapret.sessions import FileSessionBackend, SQLiteSessionBackend
 
 
@@ -106,7 +106,7 @@ async def run(args: argparse.Namespace) -> None:
 
     if args.command == "set-proxy":
         proxy_url = args.proxy_url or prompt_proxy_url()
-        parse_proxy_url(proxy_url)
+        validate_proxy_url(proxy_url)
         AppSettings(proxy_url=proxy_url).save(settings_path)
         print(f"proxy saved: {mask_proxy_url(proxy_url)}")
     elif args.command == "clear-proxy":
@@ -203,7 +203,7 @@ async def run_menu(args: argparse.Namespace) -> None:
                     print(f"{dialog.id}\t{dialog.name}")
         elif choice == "5":
             proxy_url = prompt_proxy_url()
-            parse_proxy_url(proxy_url)
+            validate_proxy_url(proxy_url)
             AppSettings(proxy_url=proxy_url).save(settings_path)
             print(f"proxy saved: {mask_proxy_url(proxy_url)}")
         elif choice == "6":
