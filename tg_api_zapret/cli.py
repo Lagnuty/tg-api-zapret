@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 from typing import Sequence
 
-from telethon.errors import SessionPasswordNeededError
+from telethon.errors import PasswordHashInvalidError, SessionPasswordNeededError
 
 from tg_api_zapret.client import TelegramLayer
 from tg_api_zapret.config import AppSettings, TelegramConfig, validate_proxy_url
@@ -130,7 +130,7 @@ async def run_telegram_command(args: argparse.Namespace, layer: TelegramLayer) -
             try:
                 await layer.sign_in(sent_code, input("Telegram code: ").strip())
             except SessionPasswordNeededError:
-                await layer.sign_in_password(read_password(args.password_env, interactive_prompt=True))
+                await sign_in_with_password(layer, args.password_env, interactive_prompt=True)
             print("authorized")
     elif args.command == "request-code":
         sent_code = await layer.send_code(args.phone)
@@ -142,7 +142,7 @@ async def run_telegram_command(args: argparse.Namespace, layer: TelegramLayer) -
         try:
             await layer.sign_in(sent_code, args.code)
         except SessionPasswordNeededError:
-            await layer.sign_in_password(read_password(args.password_env))
+            await sign_in_with_password(layer, args.password_env)
         print("authorized")
     elif args.command == "status":
         print("authorized" if await layer.is_authorized() else "not authorized")
@@ -176,43 +176,53 @@ async def run_menu(args: argparse.Namespace) -> None:
         choice = input("Choose: ").strip()
         if choice == "0":
             return
-        if choice == "1":
-            layer = build_layer(args, settings)
-            async with layer.lifespan():
-                if await layer.is_authorized():
-                    print("Telegram layer started: authorized")
-                else:
-                    await run_telegram_command(argparse.Namespace(command="login", phone=None, password_env="TELEGRAM_2FA_PASSWORD"), layer)
-        elif choice == "2":
-            layer = build_layer(args, settings)
-            async with layer.lifespan():
-                print("authorized" if await layer.is_authorized() else "not authorized")
-        elif choice == "3":
-            entity = input("Entity/user/chat: ").strip()
-            text = input("Text: ")
-            layer = build_layer(args, settings)
-            async with layer.lifespan():
-                await layer.send_message(entity, text)
-                print("sent")
-        elif choice == "4":
-            limit_value = input("Limit [20]: ").strip() or "20"
-            layer = build_layer(args, settings)
-            async with layer.lifespan():
-                dialogs = await layer.get_dialogs(limit=int(limit_value))
-                for dialog in dialogs:
-                    print(f"{dialog.id}\t{dialog.name}")
-        elif choice == "5":
-            proxy_url = prompt_proxy_url()
-            validate_proxy_url(proxy_url)
-            AppSettings(proxy_url=proxy_url).save(settings_path)
-            print(f"proxy saved: {mask_proxy_url(proxy_url)}")
-        elif choice == "6":
-            AppSettings(proxy_url=None).save(settings_path)
-            print("proxy cleared")
-        elif choice == "7":
-            print_config(settings)
-        else:
-            print("Unknown menu item")
+        try:
+            if choice == "1":
+                layer = build_layer(args, settings)
+                async with layer.lifespan():
+                    if await layer.is_authorized():
+                        print("Telegram layer started: authorized")
+                    else:
+                        await run_telegram_command(
+                            argparse.Namespace(
+                                command="login",
+                                phone=None,
+                                password_env="TELEGRAM_2FA_PASSWORD",
+                            ),
+                            layer,
+                        )
+            elif choice == "2":
+                layer = build_layer(args, settings)
+                async with layer.lifespan():
+                    print("authorized" if await layer.is_authorized() else "not authorized")
+            elif choice == "3":
+                entity = input("Entity/user/chat: ").strip()
+                text = input("Text: ")
+                layer = build_layer(args, settings)
+                async with layer.lifespan():
+                    await layer.send_message(entity, text)
+                    print("sent")
+            elif choice == "4":
+                limit_value = input("Limit [20]: ").strip() or "20"
+                layer = build_layer(args, settings)
+                async with layer.lifespan():
+                    dialogs = await layer.get_dialogs(limit=int(limit_value))
+                    for dialog in dialogs:
+                        print(f"{dialog.id}\t{dialog.name}")
+            elif choice == "5":
+                proxy_url = prompt_proxy_url()
+                validate_proxy_url(proxy_url)
+                AppSettings(proxy_url=proxy_url).save(settings_path)
+                print(f"proxy saved: {mask_proxy_url(proxy_url)}")
+            elif choice == "6":
+                AppSettings(proxy_url=None).save(settings_path)
+                print("proxy cleared")
+            elif choice == "7":
+                print_config(settings)
+            else:
+                print("Unknown menu item")
+        except RuntimeError as exc:
+            print(f"Error: {exc}")
 
 
 def build_layer(args: argparse.Namespace, settings: AppSettings) -> TelegramLayer:
@@ -261,6 +271,33 @@ def read_password(env_name: str, *, interactive_prompt: bool = False) -> str:
     raise RuntimeError(
         f"Telegram two-step password is required. Set {env_name} or run from an interactive TTY."
     )
+
+
+async def sign_in_with_password(
+    layer: TelegramLayer,
+    env_name: str,
+    *,
+    interactive_prompt: bool = False,
+    max_attempts: int = 3,
+) -> None:
+    env_password = os.getenv(env_name)
+    if env_password:
+        try:
+            await layer.sign_in_password(env_password)
+            return
+        except PasswordHashInvalidError as exc:
+            raise RuntimeError(f"Two-step password from {env_name} is invalid") from exc
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await layer.sign_in_password(read_password(env_name, interactive_prompt=interactive_prompt))
+            return
+        except PasswordHashInvalidError:
+            attempts_left = max_attempts - attempt
+            if attempts_left:
+                print(f"Invalid two-step password. Attempts left: {attempts_left}")
+            else:
+                raise RuntimeError("Invalid two-step password")
 
 
 if __name__ == "__main__":
