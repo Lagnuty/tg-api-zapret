@@ -90,6 +90,52 @@ asyncio.run(main())
 python -m tg_api_zapret --session-db ~/.config/tg-api-zapret/sessions.sqlite3 --session-key main login
 ```
 
+## Интерактивное меню
+
+```bash
+python -m tg_api_zapret --menu
+```
+
+В меню можно запустить прослойку и авторизацию, проверить статус, отправить
+сообщение, вывести диалоги, указать прокси или очистить настройки прокси.
+
+## Прокси для Telegram
+
+Прокси можно сохранить в конфиге приложения:
+
+```bash
+python -m tg_api_zapret set-proxy socks5d://127.0.0.1:1080
+```
+
+Поддерживаемые схемы:
+
+- `http://host:port`
+- `https://host:port`
+- `socks5://host:port`
+- `socks5d://host:port`
+- `socks5h://host:port`
+- `socks5://user:password@host:port`
+- `socks5d://user:password@host:port`
+- `socks5h://user:password@host:port`
+
+`socks5d` и `socks5h` включают разрешение доменов через прокси. `socks5`
+оставляет DNS на стороне машины, где запущена программа.
+
+Посмотреть текущую настройку:
+
+```bash
+python -m tg_api_zapret show-config
+```
+
+Удалить прокси:
+
+```bash
+python -m tg_api_zapret clear-proxy
+```
+
+Переменная окружения `TELEGRAM_PROXY_URL` тоже поддерживается, но сохраненный
+прокси из config-файла имеет приоритет.
+
 ## Raw RPC
 
 ```python

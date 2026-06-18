@@ -4,6 +4,7 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
+.local/
 dist/
 build/
 *.egg-info/
@@ -11,4 +12,3 @@ build/
 *.session-journal
 telegram.session.txt
 sessions.sqlite3
-

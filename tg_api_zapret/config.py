@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import os
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -25,8 +27,8 @@ class TelegramConfig:
     proxy: tuple[Any, ...] | None = None
 
     @classmethod
-    def from_env(cls) -> "TelegramConfig":
-        proxy_url = os.getenv("TELEGRAM_PROXY_URL")
+    def from_env(cls, *, proxy_url: str | None = None) -> "TelegramConfig":
+        resolved_proxy_url = proxy_url or os.getenv("TELEGRAM_PROXY_URL")
         return cls(
             api_id=int(os.getenv("TELEGRAM_API_ID", OFFICIAL_DESKTOP_API_ID)),
             api_hash=os.getenv("TELEGRAM_API_HASH", OFFICIAL_DESKTOP_API_HASH),
@@ -39,15 +41,40 @@ class TelegramConfig:
             connection_retries=int(os.getenv("TELEGRAM_CONNECTION_RETRIES", "5")),
             retry_delay=int(os.getenv("TELEGRAM_RETRY_DELAY", "2")),
             timeout=int(os.getenv("TELEGRAM_TIMEOUT", "30")),
-            proxy=parse_proxy_url(proxy_url) if proxy_url else None,
+            proxy=parse_proxy_url(resolved_proxy_url) if resolved_proxy_url else None,
         )
+
+
+@dataclass(frozen=True)
+class AppSettings:
+    proxy_url: str | None = None
+
+    @classmethod
+    def load(cls, path: str | Path) -> "AppSettings":
+        settings_path = Path(path).expanduser()
+        if not settings_path.exists():
+            return cls()
+        data = json.loads(settings_path.read_text(encoding="utf-8"))
+        return cls(proxy_url=data.get("proxy_url") or None)
+
+    def save(self, path: str | Path) -> None:
+        settings_path = Path(path).expanduser()
+        settings_path.parent.mkdir(parents=True, exist_ok=True)
+        settings_path.write_text(
+            json.dumps({"proxy_url": self.proxy_url}, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        try:
+            settings_path.chmod(0o600)
+        except OSError:
+            pass
 
 
 def parse_proxy_url(proxy_url: str) -> tuple[Any, ...]:
     parsed = urlparse(proxy_url)
     scheme = parsed.scheme.lower()
-    if scheme not in {"socks4", "socks5", "http"}:
-        raise ValueError("TELEGRAM_PROXY_URL must use socks4, socks5, or http scheme")
+    if scheme not in {"http", "https", "socks5", "socks5d", "socks5h"}:
+        raise ValueError("Proxy URL must use http, https, socks5, socks5d, or socks5h scheme")
 
     try:
         import socks
@@ -55,19 +82,22 @@ def parse_proxy_url(proxy_url: str) -> tuple[Any, ...]:
         raise RuntimeError("PySocks is required for proxy support") from exc
 
     proxy_type = {
-        "socks4": socks.SOCKS4,
-        "socks5": socks.SOCKS5,
         "http": socks.HTTP,
+        "https": socks.HTTP,
+        "socks5": socks.SOCKS5,
+        "socks5d": socks.SOCKS5,
+        "socks5h": socks.SOCKS5,
     }[scheme]
     if not parsed.hostname or not parsed.port:
-        raise ValueError("TELEGRAM_PROXY_URL must include host and port")
+        raise ValueError("Proxy URL must include host and port")
+
+    rdns = scheme in {"https", "socks5d", "socks5h"}
 
     return (
         proxy_type,
         parsed.hostname,
         parsed.port,
-        True,
+        rdns,
         parsed.username,
         parsed.password,
     )
-
