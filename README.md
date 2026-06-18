@@ -38,22 +38,30 @@ export TELEGRAM_PROXY_URL=socks5://user:password@127.0.0.1:1080
 ## Первичная авторизация
 
 ```bash
-tg-api-zapret --session-file ~/.config/tg-api-zapret/session.txt login +79990000000
+python -m tg_api_zapret --session-file ~/.config/tg-api-zapret/session.txt login
 ```
 
-После успешного входа session string будет сохранена в файл с правами `0600`.
+Программа последовательно спросит номер телефона, код подтверждения и, если на
+аккаунте включена двухэтапная проверка, 2FA-пароль. После успешного входа session
+string будет сохранена в файл с правами `0600`.
 На следующих запусках код подтверждения больше не нужен.
+
+Номер также можно передать сразу:
+
+```bash
+python -m tg_api_zapret --session-file ~/.config/tg-api-zapret/session.txt login +79990000000
+```
 
 Проверка:
 
 ```bash
-tg-api-zapret --session-file ~/.config/tg-api-zapret/session.txt status
+python -m tg_api_zapret --session-file ~/.config/tg-api-zapret/session.txt status
 ```
 
 Отправка сообщения:
 
 ```bash
-tg-api-zapret --session-file ~/.config/tg-api-zapret/session.txt send me "test message"
+python -m tg_api_zapret --session-file ~/.config/tg-api-zapret/session.txt send me "test message"
 ```
 
 ## Использование как библиотеки
@@ -79,7 +87,7 @@ asyncio.run(main())
 ## SQLite-хранилище сессии
 
 ```bash
-tg-api-zapret --session-db ~/.config/tg-api-zapret/sessions.sqlite3 --session-key main login +79990000000
+python -m tg_api_zapret --session-db ~/.config/tg-api-zapret/sessions.sqlite3 --session-key main login
 ```
 
 ## Raw RPC
@@ -95,4 +103,3 @@ result = await layer.invoke(GetFullUserRequest("me"))
 ```bash
 pytest
 ```
-

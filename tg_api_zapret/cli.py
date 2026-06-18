@@ -28,7 +28,11 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     login = subparsers.add_parser("login", help="Authorize and persist a Telegram session.")
-    login.add_argument("phone", help="Phone number in international format.")
+    login.add_argument(
+        "phone",
+        nargs="?",
+        help="Phone number in international format. If omitted, it is requested interactively.",
+    )
     login.add_argument(
         "--password-env",
         default="TELEGRAM_2FA_PASSWORD",
@@ -76,11 +80,15 @@ async def run(args: argparse.Namespace) -> None:
 
     async with layer.lifespan():
         if args.command == "login":
-            sent_code = await layer.send_code(args.phone)
+            phone = args.phone or input("Phone number: ").strip()
+            if not phone:
+                raise RuntimeError("Phone number is required")
+
+            sent_code = await layer.send_code(phone)
             try:
                 await layer.sign_in(sent_code, input("Telegram code: ").strip())
             except SessionPasswordNeededError:
-                await layer.sign_in_password(read_password(args.password_env))
+                await layer.sign_in_password(read_password(args.password_env, interactive_prompt=True))
             print("authorized")
         elif args.command == "request-code":
             sent_code = await layer.send_code(args.phone)
@@ -107,11 +115,11 @@ async def run(args: argparse.Namespace) -> None:
             raise ValueError(f"Unsupported command: {args.command}")
 
 
-def read_password(env_name: str) -> str:
+def read_password(env_name: str, *, interactive_prompt: bool = False) -> str:
     value = os.getenv(env_name)
     if value:
         return value
-    if sys.stdin.isatty():
+    if interactive_prompt or sys.stdin.isatty():
         return getpass("Two-step password: ")
     raise RuntimeError(
         f"Telegram two-step password is required. Set {env_name} or run from an interactive TTY."
