@@ -1,5 +1,4 @@
 import pytest
-import socks
 
 from tg_api_zapret.config import (
     OFFICIAL_DESKTOP_API_HASH,
@@ -32,14 +31,14 @@ def test_config_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
 @pytest.mark.parametrize(
     ("proxy_url", "proxy_type", "rdns"),
     [
-        ("http://127.0.0.1:8080", socks.HTTP, False),
-        ("https://127.0.0.1:8080", socks.HTTP, True),
-        ("socks5://127.0.0.1:1080", socks.SOCKS5, False),
-        ("socks5d://127.0.0.1:1080", socks.SOCKS5, True),
-        ("socks5h://127.0.0.1:1080", socks.SOCKS5, True),
+        ("http://127.0.0.1:8080", "http", False),
+        ("https://127.0.0.1:8080", "http", True),
+        ("socks5://127.0.0.1:1080", "socks5", False),
+        ("socks5d://127.0.0.1:1080", "socks5", True),
+        ("socks5h://127.0.0.1:1080", "socks5", True),
     ],
 )
-def test_parse_proxy_url(proxy_url: str, proxy_type: int, rdns: bool) -> None:
+def test_parse_proxy_url(proxy_url: str, proxy_type: str, rdns: bool) -> None:
     parsed = parse_proxy_url(proxy_url)
 
     assert parsed[:4] == (proxy_type, "127.0.0.1", int(proxy_url.rsplit(":", 1)[1]), rdns)
@@ -48,7 +47,7 @@ def test_parse_proxy_url(proxy_url: str, proxy_type: int, rdns: bool) -> None:
 def test_parse_proxy_url_with_auth() -> None:
     parsed = parse_proxy_url("socks5d://user:password@127.0.0.1:1080")
 
-    assert parsed == (socks.SOCKS5, "127.0.0.1", 1080, True, "user", "password")
+    assert parsed == ("socks5", "127.0.0.1", 1080, True, "user", "password")
 
 
 def test_app_settings_roundtrip(tmp_path) -> None:

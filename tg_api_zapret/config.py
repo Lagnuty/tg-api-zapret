@@ -73,22 +73,7 @@ class AppSettings:
 def parse_proxy_url(proxy_url: str) -> tuple[Any, ...]:
     parsed = validate_proxy_url(proxy_url)
     scheme = parsed.scheme.lower()
-
-    try:
-        import socks
-    except ImportError as exc:  # pragma: no cover - dependency is declared.
-        raise RuntimeError(
-            "PySocks is required for proxy support. Install dependencies with: "
-            'python -m pip install -e "." or python -m pip install -r requirements.txt'
-        ) from exc
-
-    proxy_type = {
-        "http": socks.HTTP,
-        "https": socks.HTTP,
-        "socks5": socks.SOCKS5,
-        "socks5d": socks.SOCKS5,
-        "socks5h": socks.SOCKS5,
-    }[scheme]
+    proxy_type = "http" if scheme == "https" else "socks5" if scheme in {"socks5d", "socks5h"} else scheme
     rdns = scheme in {"https", "socks5d", "socks5h"}
 
     return (

@@ -13,6 +13,7 @@ authors = [{ name = "tg-api-zapret maintainers" }]
 dependencies = [
   "Telethon>=1.36,<2.0",
   "PySocks>=1.7,<2.0",
+  "python-socks[asyncio]>=2.4,<3.0",
 ]
 
 [project.optional-dependencies]
@@ -35,4 +36,3 @@ asyncio_mode = "auto"
 [tool.ruff]
 line-length = 100
 target-version = "py310"
-

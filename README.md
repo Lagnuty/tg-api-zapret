@@ -29,6 +29,12 @@ python -m pip install -e ".[dev]"
 python -m pip install -r requirements.txt
 ```
 
+Для прокси Telethon 1.44 требует пакет `python-socks`:
+
+```bash
+python -m pip install "python-socks[asyncio]>=2.4,<3.0"
+```
+
 ## Переменные окружения
 
 ```bash
