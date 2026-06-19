@@ -165,7 +165,7 @@ HTTP API.
 python -m tg_api_zapret set-client-profile \
   --device-model "Telegram Desktop" \
   --system-version "Linux x86_64" \
-  --app-version 0.4.7
+  --app-version 0.4.8
 ```
 
 Для уже существующей сессии Telegram может оставить старое название. Надежный
