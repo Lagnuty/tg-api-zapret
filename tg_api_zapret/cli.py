@@ -135,8 +135,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     profile = subparsers.add_parser("set-client-profile", help="Set Telegram device name/profile.")
-    profile.add_argument("--device-model", default="tg-api-zapret")
-    profile.add_argument("--system-version", default="Linux")
+    profile.add_argument("--device-model", default="Telegram Desktop")
+    profile.add_argument("--system-version", default="Linux x86_64")
     profile.add_argument("--app-version", default=__version__)
     profile.add_argument("--lang-code", default="en")
     profile.add_argument("--system-lang-code", default="en-US")

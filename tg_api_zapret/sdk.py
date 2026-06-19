@@ -38,6 +38,21 @@ class TgApiZapretClient:
             body={"entity": entity, "text": text, "parse_mode": parse_mode},
         )
 
+    def send_username_message(
+        self,
+        username: str,
+        text: str,
+        *,
+        account: str | None = None,
+        parse_mode: str | None = None,
+    ) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            "/messages/send-username",
+            query=account_query(account),
+            body={"username": username, "text": text, "parse_mode": parse_mode},
+        )
+
     def send_media(
         self,
         entity: str | int,

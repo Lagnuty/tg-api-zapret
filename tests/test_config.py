@@ -15,6 +15,8 @@ def test_config_uses_official_desktop_defaults() -> None:
 
     assert config.api_id == OFFICIAL_DESKTOP_API_ID
     assert config.api_hash == OFFICIAL_DESKTOP_API_HASH
+    assert config.device_model == "Telegram Desktop"
+    assert config.system_version == "Linux x86_64"
     assert config.app_version == __version__
 
 
@@ -105,3 +107,14 @@ def test_app_settings_accounts_roundtrip(tmp_path) -> None:
 
     assert loaded.active_account == "work_account"
     assert loaded.accounts == ["default", "work_account"]
+
+
+def test_partial_service_settings_uses_safety_defaults(tmp_path) -> None:
+    path = tmp_path / "config.json"
+    path.write_text('{"service":{"rate_limit_per_minute":10}}', encoding="utf-8")
+
+    loaded = AppSettings.load(path)
+
+    assert loaded.service.rate_limit_per_minute == 10
+    assert loaded.service.blocked_account_names == ["string", "account"]
+    assert loaded.service.telegram_min_action_interval_seconds == 1.25

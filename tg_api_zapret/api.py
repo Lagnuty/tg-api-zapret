@@ -19,8 +19,8 @@ from fastapi.responses import JSONResponse
 from starlette.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from starlette.responses import StreamingResponse
-from telethon import events
-from telethon.errors import PasswordHashInvalidError, SessionPasswordNeededError
+from telethon import events, utils
+from telethon.errors import FloodWaitError, PasswordHashInvalidError, RPCError, SessionPasswordNeededError
 from telethon.tl import functions, types
 from telethon.tl.custom.dialog import Dialog
 from telethon.tl.custom.message import Message
@@ -65,8 +65,16 @@ class ApiState:
         self.session_db = Path(session_db).expanduser() if session_db else None
         self.default_account = normalize_account_name(default_account)
         self.layers: dict[str, TelegramLayer] = {}
-        self.queue: QueueBackend = build_queue_backend(queue_backend, redis_url=redis_url)
+        service = self.settings().service
+        self.queue: QueueBackend = build_queue_backend(
+            queue_backend,
+            redis_url=redis_url,
+            visibility_timeout_seconds=service.queue_visibility_timeout_seconds,
+        )
         self.rate_limits: dict[str, list[float]] = {}
+        self.telegram_rate_limits: dict[str, list[float]] = {}
+        self.telegram_auth_rate_limits: dict[str, list[float]] = {}
+        self.last_telegram_action_at: dict[str, float] = {}
         self.bot_updates: dict[str, list[dict[str, Any]]] = {}
         self.bot_update_ids: dict[str, int] = {}
         self.bot_update_handlers: dict[str, tuple[Any, Any]] = {}
@@ -116,7 +124,15 @@ class ApiState:
         return self.layers[account_name]
 
     def resolve_account(self, account: str | None = None) -> str:
-        return normalize_account_name(account or self.settings().active_account or self.default_account)
+        account_name = normalize_account_name(account or self.settings().active_account or self.default_account)
+        service = self.settings().service
+        blocked = {normalize_account_name(item) for item in service.blocked_account_names}
+        if account_name in blocked:
+            raise ValueError(
+                f"Unsafe demo account name '{account_name}' is blocked. "
+                "Choose a real account alias, for example main/work/personal."
+            )
+        return account_name
 
 
 class ProxyPayload(BaseModel):
@@ -128,8 +144,8 @@ class AccountPayload(BaseModel):
 
 
 class ClientProfilePayload(BaseModel):
-    device_model: str = Field(default="tg-api-zapret", min_length=1)
-    system_version: str = Field(default="Linux", min_length=1)
+    device_model: str = Field(default="Telegram Desktop", min_length=1)
+    system_version: str = Field(default="Linux x86_64", min_length=1)
     app_version: str = Field(default=__version__, min_length=1)
     lang_code: str = Field(default="en", min_length=1)
     system_lang_code: str = Field(default="en-US", min_length=1)
@@ -145,16 +161,24 @@ class ServiceSettingsPayload(BaseModel):
     max_queue_jobs_list: int = Field(default=1000, ge=1)
     stream_queue_size: int = Field(default=100, ge=1)
     request_timeout_seconds: int = Field(default=60, ge=1)
-    expose_docs: bool = True
+    expose_docs: bool = False
     cors_origins: list[str] = Field(default_factory=list)
-    require_api_token: bool = False
+    require_api_token: bool = True
     api_token_env: str = "TG_API_TOKEN"
     api_tokens_env: str = "TG_API_TOKENS"
     rate_limit_per_minute: int = Field(default=120, ge=0)
     audit_log_path: str | None = None
-    enable_raw_invoke: bool = True
-    enable_layer_invoke: bool = True
+    enable_raw_invoke: bool = False
+    enable_layer_invoke: bool = False
     bot_token_accounts: dict[str, str] = Field(default_factory=dict)
+    telegram_actions_per_minute: int = Field(default=20, ge=1)
+    telegram_auth_requests_per_hour: int = Field(default=3, ge=1)
+    max_dialog_limit: int = Field(default=100, ge=1)
+    max_message_limit: int = Field(default=100, ge=1)
+    blocked_account_names: list[str] = Field(default_factory=lambda: ["string", "account"])
+    telegram_min_action_interval_seconds: float = Field(default=1.25, ge=0)
+    queue_visibility_timeout_seconds: int = Field(default=300, ge=1)
+    queue_default_max_attempts: int = Field(default=3, ge=1)
 
 
 class SendCodePayload(BaseModel):
@@ -173,6 +197,12 @@ class PasswordPayload(BaseModel):
 
 class SendMessagePayload(BaseModel):
     entity: str | int
+    text: str
+    parse_mode: str | None = None
+
+
+class SendUsernameMessagePayload(BaseModel):
+    username: str = Field(description="Telegram username with or without @, phone, or t.me link.")
     text: str
     parse_mode: str | None = None
 
@@ -298,6 +328,8 @@ class QueueJobPayload(BaseModel):
     kind: str
     account: str | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
+    idempotency_key: str | None = None
+    max_attempts: int | None = Field(default=None, ge=1)
 
 
 class ActionResolvePayload(BaseModel):
@@ -357,6 +389,13 @@ def create_app(state: ApiState) -> FastAPI:
             await audit_request(state, request, 403, token)
             REQUEST_SCOPES.reset(scope_token)
             return JSONResponse({"detail": "Account is not allowed for this token"}, status_code=403)
+        if account:
+            try:
+                state.resolve_account(account)
+            except ValueError as exc:
+                await audit_request(state, request, 400, token)
+                REQUEST_SCOPES.reset(scope_token)
+                return JSONResponse({"detail": str(exc)}, status_code=400)
 
         try:
             response = await asyncio.wait_for(
@@ -368,6 +407,39 @@ def create_app(state: ApiState) -> FastAPI:
         except TimeoutError:
             await audit_request(state, request, 504, token)
             return JSONResponse({"detail": "Request timeout"}, status_code=504)
+        except FloodWaitError as exc:
+            await audit_request(state, request, 429, token)
+            return JSONResponse(
+                {
+                    "detail": "Telegram flood wait",
+                    "seconds": getattr(exc, "seconds", None),
+                    "retry_after": getattr(exc, "seconds", None),
+                },
+                status_code=429,
+                headers={"Retry-After": str(getattr(exc, "seconds", 60))},
+            )
+        except RPCError as exc:
+            await audit_request(state, request, 502, token)
+            return JSONResponse(
+                {
+                    "detail": "Telegram RPC error",
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                },
+                status_code=502,
+            )
+        except PermissionError as exc:
+            await audit_request(state, request, 401, token)
+            return JSONResponse({"detail": str(exc)}, status_code=401)
+        except ValueError as exc:
+            await audit_request(state, request, 400, token)
+            return JSONResponse({"detail": str(exc)}, status_code=400)
+        except ConnectionError as exc:
+            await audit_request(state, request, 503, token)
+            return JSONResponse(
+                {"detail": "Telegram connection failed", "message": str(exc)},
+                status_code=503,
+            )
         finally:
             REQUEST_SCOPES.reset(scope_token)
 
@@ -384,6 +456,7 @@ def create_app(state: ApiState) -> FastAPI:
                     "endpoints": [
                         "GET /dialogs",
                         "POST /messages/send",
+                        "POST /messages/send-username",
                         "POST /messages/edit",
                         "POST /messages/delete",
                         "POST /messages/forward",
@@ -427,6 +500,11 @@ def create_app(state: ApiState) -> FastAPI:
                     "description": "Python client wrapper around HTTP/JSON-RPC/Queue APIs.",
                     "class": "tg_api_zapret.TgApiZapretClient",
                 },
+                "bot_api_compat": {
+                    "description": "Limited Bot API compatibility layer, not a full Telegram Bot API proxy.",
+                    "endpoint": "GET|POST /bot{token}/{method}",
+                    "methods": sorted(BOT_API_COMPAT_METHODS),
+                },
             },
             "service_settings": state.settings().service.to_dict(),
             "actions": ACTIONS,
@@ -452,6 +530,10 @@ def create_app(state: ApiState) -> FastAPI:
                 "kind": queue_payload.kind,
                 "account": state.resolve_account(queue_payload.account),
                 "payload": queue_payload.payload,
+                "idempotency_key": queue_payload.idempotency_key,
+                "attempts": 0,
+                "max_attempts": queue_payload.max_attempts
+                or state.settings().service.queue_default_max_attempts,
                 "status": "queued",
                 "result": None,
                 "error": None,
@@ -559,6 +641,7 @@ def create_app(state: ApiState) -> FastAPI:
 
     @app.post("/accounts")
     async def add_account(payload: AccountPayload) -> dict[str, Any]:
+        ensure_safe_account_payload(state, payload.account)
         settings = state.settings().with_account(payload.account)
         state.save_settings(settings)
         return {"active_account": settings.active_account, "accounts": settings.accounts}
@@ -587,6 +670,7 @@ def create_app(state: ApiState) -> FastAPI:
 
     @app.post("/auth/send-code")
     async def send_code(payload: SendCodePayload, account: str | None = None) -> dict[str, str]:
+        ensure_telegram_auth_rate(state, account)
         layer = await state.require_layer(account)
         sent = await layer.send_code(payload.phone)
         return {
@@ -597,6 +681,7 @@ def create_app(state: ApiState) -> FastAPI:
 
     @app.post("/auth/confirm-code")
     async def confirm_code(payload: ConfirmCodePayload, account: str | None = None) -> dict[str, str]:
+        ensure_telegram_auth_rate(state, account)
         layer = await state.require_layer(account)
         try:
             await layer.sign_in(
@@ -609,6 +694,7 @@ def create_app(state: ApiState) -> FastAPI:
 
     @app.post("/auth/password")
     async def confirm_password(payload: PasswordPayload, account: str | None = None) -> dict[str, str]:
+        ensure_telegram_auth_rate(state, account)
         layer = await state.require_layer(account)
         try:
             await layer.sign_in_password(payload.password)
@@ -618,11 +704,14 @@ def create_app(state: ApiState) -> FastAPI:
 
     @app.get("/me")
     async def me(account: str | None = None) -> dict[str, Any]:
+        ensure_telegram_rate(state, account, "me")
         client = await require_authorized_client(state, account)
         return serialize_user(await client.get_me())
 
     @app.get("/dialogs")
     async def dialogs(limit: int = 20, account: str | None = None) -> list[dict[str, Any]]:
+        ensure_telegram_rate(state, account, "dialogs")
+        limit = clamp_limit(limit, state.settings().service.max_dialog_limit)
         layer = await state.require_layer(account)
         return [serialize_dialog(dialog) for dialog in await layer.get_dialogs(limit=limit)]
 
@@ -632,6 +721,8 @@ def create_app(state: ApiState) -> FastAPI:
         limit: int = 50,
         account: str | None = None,
     ) -> list[dict[str, Any]]:
+        ensure_telegram_rate(state, account, "messages")
+        limit = clamp_limit(limit, state.settings().service.max_message_limit)
         layer = await state.require_layer(account)
         return [serialize_message(message) async for message in layer.iter_messages(entity, limit=limit)]
 
@@ -640,9 +731,24 @@ def create_app(state: ApiState) -> FastAPI:
         payload: SendMessagePayload,
         account: str | None = None,
     ) -> dict[str, Any]:
+        ensure_telegram_rate(state, account, "messages.send")
         layer = await state.require_layer(account)
         message = await layer.send_message(
             payload.entity,
+            payload.text,
+            parse_mode=payload.parse_mode,
+        )
+        return serialize_message(message)
+
+    @app.post("/messages/send-username")
+    async def send_username_message(
+        payload: SendUsernameMessagePayload,
+        account: str | None = None,
+    ) -> dict[str, Any]:
+        ensure_telegram_rate(state, account, "messages.send")
+        layer = await state.require_layer(account)
+        message = await layer.send_message(
+            normalize_username_entity(payload.username),
             payload.text,
             parse_mode=payload.parse_mode,
         )
@@ -653,6 +759,7 @@ def create_app(state: ApiState) -> FastAPI:
         payload: EditMessagePayload,
         account: str | None = None,
     ) -> dict[str, Any]:
+        ensure_telegram_rate(state, account, "messages.edit")
         client = await require_authorized_client(state, account)
         message = await client.edit_message(payload.entity, payload.message_id, payload.text)
         return serialize_message(message)
@@ -662,6 +769,7 @@ def create_app(state: ApiState) -> FastAPI:
         payload: DeleteMessagesPayload,
         account: str | None = None,
     ) -> dict[str, Any]:
+        ensure_telegram_rate(state, account, "messages.delete")
         client = await require_authorized_client(state, account)
         result = await client.delete_messages(
             payload.entity,
@@ -675,6 +783,7 @@ def create_app(state: ApiState) -> FastAPI:
         payload: ForwardMessagesPayload,
         account: str | None = None,
     ) -> list[dict[str, Any]]:
+        ensure_telegram_rate(state, account, "messages.forward")
         client = await require_authorized_client(state, account)
         result = await client.forward_messages(
             payload.to_entity,
@@ -689,6 +798,7 @@ def create_app(state: ApiState) -> FastAPI:
         payload: EntityPayload,
         account: str | None = None,
     ) -> dict[str, Any]:
+        ensure_telegram_rate(state, account, "messages.history.delete")
         client = await require_authorized_client(state, account)
         peer = await resolve_entity(payload.entity, client=client)
         result = await client(functions.messages.DeleteHistoryRequest(peer=peer, max_id=0))
@@ -699,6 +809,7 @@ def create_app(state: ApiState) -> FastAPI:
         payload: ReactionPayload,
         account: str | None = None,
     ) -> dict[str, Any]:
+        ensure_telegram_rate(state, account, "messages.reaction")
         client = await require_authorized_client(state, account)
         peer = await resolve_entity(payload.entity, client=client)
         reaction = await build_reaction(payload.reaction, client)
@@ -718,6 +829,7 @@ def create_app(state: ApiState) -> FastAPI:
         payload: SendMediaPayload,
         account: str | None = None,
     ) -> dict[str, Any]:
+        ensure_telegram_rate(state, account, "media.send")
         client = await require_authorized_client(state, account)
         file_value, cleanup = decode_upload_file(payload.file_path, payload.file_base64, payload.file_name)
         try:
@@ -737,6 +849,7 @@ def create_app(state: ApiState) -> FastAPI:
         payload: DownloadMediaPayload,
         account: str | None = None,
     ) -> dict[str, Any]:
+        ensure_telegram_rate(state, account, "media.download")
         client = await require_authorized_client(state, account)
         message = await client.get_messages(payload.entity, ids=payload.message_id)
         if not message:
@@ -758,6 +871,7 @@ def create_app(state: ApiState) -> FastAPI:
         payload: UploadFilePayload,
         account: str | None = None,
     ) -> dict[str, Any]:
+        ensure_telegram_rate(state, account, "files.upload")
         client = await require_authorized_client(state, account)
         file_value, cleanup = decode_upload_file(payload.file_path, payload.file_base64, payload.file_name)
         try:
@@ -772,6 +886,7 @@ def create_app(state: ApiState) -> FastAPI:
         payload: EntityPayload,
         account: str | None = None,
     ) -> dict[str, Any]:
+        ensure_telegram_rate(state, account, "entities.resolve")
         client = await require_authorized_client(state, account)
         entity = await client.get_entity(payload.entity)
         input_entity = await resolve_entity(payload.entity, client=client)
@@ -782,6 +897,7 @@ def create_app(state: ApiState) -> FastAPI:
         payload: JoinLeavePayload,
         account: str | None = None,
     ) -> dict[str, Any]:
+        ensure_telegram_rate(state, account, "chats.join")
         client = await require_authorized_client(state, account)
         request = await build_tl_request(
             "channels.JoinChannelRequest",
@@ -796,6 +912,7 @@ def create_app(state: ApiState) -> FastAPI:
         payload: JoinLeavePayload,
         account: str | None = None,
     ) -> dict[str, Any]:
+        ensure_telegram_rate(state, account, "chats.leave")
         client = await require_authorized_client(state, account)
         request = await build_tl_request(
             "channels.LeaveChannelRequest",
@@ -810,6 +927,7 @@ def create_app(state: ApiState) -> FastAPI:
         payload: StoryGetPayload,
         account: str | None = None,
     ) -> dict[str, Any]:
+        ensure_telegram_rate(state, account, "stories.get")
         client = await require_authorized_client(state, account)
         peer = await resolve_entity(payload.entity, client=client)
         result = await client(functions.stories.GetStoriesByIDRequest(peer=peer, id=payload.story_ids))
@@ -820,6 +938,7 @@ def create_app(state: ApiState) -> FastAPI:
         payload: StorySendPayload,
         account: str | None = None,
     ) -> dict[str, Any]:
+        ensure_telegram_rate(state, account, "stories.send")
         client = await require_authorized_client(state, account)
         kwargs = {
             "peer": payload.peer,
@@ -844,6 +963,7 @@ def create_app(state: ApiState) -> FastAPI:
         payload: AdminBanPayload,
         account: str | None = None,
     ) -> dict[str, Any]:
+        ensure_telegram_rate(state, account, "admin.ban")
         client = await require_authorized_client(state, account)
         request = await build_tl_request(
             "channels.EditBannedRequest",
@@ -862,6 +982,7 @@ def create_app(state: ApiState) -> FastAPI:
         payload: AdminPromotePayload,
         account: str | None = None,
     ) -> dict[str, Any]:
+        ensure_telegram_rate(state, account, "admin.promote")
         client = await require_authorized_client(state, account)
         request = await build_tl_request(
             "channels.EditAdminRequest",
@@ -889,6 +1010,7 @@ def create_app(state: ApiState) -> FastAPI:
     @app.post("/raw/invoke")
     async def raw_invoke(payload: RawInvokePayload, account: str | None = None) -> dict[str, Any]:
         ensure_raw_enabled(state)
+        ensure_telegram_rate(state, account, "raw.invoke")
         layer = await state.require_layer(account)
         client = await layer.authorized_client()
         request = await build_tl_request(payload.request, payload.kwargs, client)
@@ -910,6 +1032,7 @@ def create_app(state: ApiState) -> FastAPI:
         account: str | None = None,
     ) -> dict[str, Any]:
         ensure_layer_enabled(state)
+        ensure_telegram_rate(state, account, "layer.invoke")
         try:
             require_layer_function(layer, payload.request)
         except ValueError as exc:
@@ -946,6 +1069,10 @@ def create_app(state: ApiState) -> FastAPI:
             "kind": payload.kind,
             "account": state.resolve_account(payload.account),
             "payload": payload.payload,
+            "idempotency_key": payload.idempotency_key,
+            "attempts": 0,
+            "max_attempts": payload.max_attempts
+            or state.settings().service.queue_default_max_attempts,
             "status": "queued",
             "result": None,
             "error": None,
@@ -1088,28 +1215,34 @@ async def dispatch_bot_api(
     normalized = method.lower()
     client = await require_authorized_client(state, account)
     if normalized == "getme":
+        ensure_telegram_rate(state, account, "bot.getme")
         return bot_user(await client.get_me())
     if normalized == "sendmessage":
+        ensure_telegram_rate(state, account, "bot.sendmessage")
         chat_id = required_param(params, "chat_id")
         text = required_param(params, "text")
         message = await client.send_message(chat_id, text, parse_mode=params.get("parse_mode"))
         return bot_message(message)
     if normalized in {"sendphoto", "senddocument"}:
+        ensure_telegram_rate(state, account, f"bot.{normalized}")
         chat_id = required_param(params, "chat_id")
         file_value = required_param(params, "photo" if normalized == "sendphoto" else "document")
         message = await client.send_file(chat_id, file_value, caption=params.get("caption"))
         return bot_message(message)
     if normalized == "editmessagetext":
+        ensure_telegram_rate(state, account, "bot.editmessagetext")
         chat_id = required_param(params, "chat_id")
         message_id = int(required_param(params, "message_id"))
         message = await client.edit_message(chat_id, message_id, required_param(params, "text"))
         return bot_message(message)
     if normalized == "deletemessage":
+        ensure_telegram_rate(state, account, "bot.deletemessage")
         chat_id = required_param(params, "chat_id")
         message_id = int(required_param(params, "message_id"))
         await client.delete_messages(chat_id, [message_id], revoke=True)
         return True
     if normalized == "getupdates":
+        ensure_telegram_rate(state, account, "bot.getupdates")
         await ensure_bot_update_handler(state, token, account)
         offset = int(params.get("offset") or 0)
         limit = int(params.get("limit") or 100)
@@ -1117,7 +1250,13 @@ async def dispatch_bot_api(
             update for update in state.bot_updates.get(token, []) if update["update_id"] >= offset
         ][:limit]
         return updates
-    raise HTTPException(status_code=404, detail=f"Unsupported Bot API method: {method}")
+    raise HTTPException(
+        status_code=404,
+        detail={
+            "message": f"Unsupported Bot API compatibility method: {method}",
+            "supported_methods": sorted(BOT_API_COMPAT_METHODS),
+        },
+    )
 
 
 async def ensure_bot_update_handler(state: ApiState, token: str, account: str) -> None:
@@ -1209,6 +1348,89 @@ def check_rate_limit(state: ApiState, key: str, limit_per_minute: int) -> bool:
     return True
 
 
+def ensure_telegram_rate(state: ApiState, account: str | None, action: str) -> None:
+    service = state.settings().service
+    account_name = state.resolve_account(account)
+    now = time.monotonic()
+    previous = state.last_telegram_action_at.get(account_name)
+    min_interval = service.telegram_min_action_interval_seconds
+    if previous is not None and min_interval > 0:
+        wait_for = min_interval - (now - previous)
+        if wait_for > 0:
+            retry_after = max(1, int(wait_for + 0.999))
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    "Telegram desktop-like pacing is active for this account. "
+                    f"Retry after {retry_after}s."
+                ),
+                headers={"Retry-After": str(retry_after)},
+            )
+    key = f"{account_name}:{action}"
+    if not check_bucket(
+        state.telegram_rate_limits,
+        key,
+        service.telegram_actions_per_minute,
+        window_seconds=60,
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "Telegram action rate limit exceeded for this account/action. "
+                f"Limit: {service.telegram_actions_per_minute}/minute."
+            ),
+            headers={"Retry-After": "60"},
+        )
+    state.last_telegram_action_at[account_name] = now
+
+
+def ensure_telegram_auth_rate(state: ApiState, account: str | None) -> None:
+    service = state.settings().service
+    account_name = state.resolve_account(account)
+    if not check_bucket(
+        state.telegram_auth_rate_limits,
+        account_name,
+        service.telegram_auth_requests_per_hour,
+        window_seconds=3600,
+    ):
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "Telegram auth rate limit exceeded for this account. "
+                f"Limit: {service.telegram_auth_requests_per_hour}/hour."
+            ),
+            headers={"Retry-After": "3600"},
+        )
+
+
+def check_bucket(
+    buckets: dict[str, list[float]],
+    key: str,
+    limit: int,
+    *,
+    window_seconds: int,
+) -> bool:
+    now = time.time()
+    window_start = now - window_seconds
+    timestamps = [item for item in buckets.get(key, []) if item >= window_start]
+    if len(timestamps) >= limit:
+        buckets[key] = timestamps
+        return False
+    timestamps.append(now)
+    buckets[key] = timestamps
+    return True
+
+
+def clamp_limit(limit: int, maximum: int) -> int:
+    if limit < 1:
+        raise HTTPException(status_code=400, detail="limit must be >= 1")
+    return min(limit, maximum)
+
+
+def ensure_safe_account_payload(state: ApiState, account: str) -> None:
+    state.resolve_account(account)
+
+
 async def audit_request(
     state: ApiState,
     request: Request,
@@ -1288,6 +1510,21 @@ def mask_url_secret(url: str | None) -> str | None:
     return f"{scheme}://{username}:***@{address}"
 
 
+def normalize_username_entity(value: str) -> str:
+    entity = value.strip()
+    if not entity:
+        raise HTTPException(status_code=400, detail="username is required")
+    for prefix in ("https://t.me/", "http://t.me/", "t.me/"):
+        if entity.startswith(prefix):
+            entity = entity.removeprefix(prefix).split("?", 1)[0].strip("/")
+            break
+    if entity.startswith("+") or entity.startswith("@") or entity.lstrip("-").isdigit():
+        return entity
+    if "/" in entity:
+        return entity
+    return f"@{entity}"
+
+
 def visible_accounts_response(settings: AppSettings, scopes: list[str] | None) -> dict[str, Any]:
     if scopes is None or "*" in scopes:
         return {"active_account": settings.active_account, "accounts": settings.accounts}
@@ -1312,12 +1549,15 @@ async def dispatch_rpc(state: ApiState, method: str, params: dict[str, Any]) -> 
         layer = await state.require_layer(account)
         return {"account": state.resolve_account(account), "authorized": await layer.is_authorized()}
     if method == "dialogs.list":
+        ensure_telegram_rate(state, account, "dialogs")
+        limit = clamp_limit(int(params.get("limit", 20)), state.settings().service.max_dialog_limit)
         layer = await state.require_layer(account)
         return [
             serialize_dialog(dialog)
-            for dialog in await layer.get_dialogs(limit=int(params.get("limit", 20)))
+            for dialog in await layer.get_dialogs(limit=limit)
         ]
     if method == "messages.send":
+        ensure_telegram_rate(state, account, "messages.send")
         layer = await state.require_layer(account)
         message = await layer.send_message(
             params["entity"],
@@ -1325,11 +1565,22 @@ async def dispatch_rpc(state: ApiState, method: str, params: dict[str, Any]) -> 
             parse_mode=params.get("parse_mode"),
         )
         return serialize_message(message)
+    if method == "messages.send_username":
+        ensure_telegram_rate(state, account, "messages.send")
+        layer = await state.require_layer(account)
+        message = await layer.send_message(
+            normalize_username_entity(params["username"]),
+            params["text"],
+            parse_mode=params.get("parse_mode"),
+        )
+        return serialize_message(message)
     if method == "messages.edit":
+        ensure_telegram_rate(state, account, "messages.edit")
         client = await require_authorized_client(state, account)
         message = await client.edit_message(params["entity"], int(params["message_id"]), params["text"])
         return serialize_message(message)
     if method == "messages.delete":
+        ensure_telegram_rate(state, account, "messages.delete")
         client = await require_authorized_client(state, account)
         result = await client.delete_messages(
             params["entity"],
@@ -1338,6 +1589,7 @@ async def dispatch_rpc(state: ApiState, method: str, params: dict[str, Any]) -> 
         )
         return {"result": serialize_tl(result)}
     if method == "messages.forward":
+        ensure_telegram_rate(state, account, "messages.forward")
         client = await require_authorized_client(state, account)
         result = await client.forward_messages(
             params["to_entity"],
@@ -1347,11 +1599,13 @@ async def dispatch_rpc(state: ApiState, method: str, params: dict[str, Any]) -> 
         messages = result if isinstance(result, list) else [result]
         return [serialize_message(message) for message in messages]
     if method == "entities.resolve":
+        ensure_telegram_rate(state, account, "entities.resolve")
         client = await require_authorized_client(state, account)
         entity = await client.get_entity(params["entity"])
         input_entity = await resolve_entity(params["entity"], client=client)
         return {"entity": serialize_tl(entity), "input_entity": serialize_tl(input_entity)}
     if method == "media.send":
+        ensure_telegram_rate(state, account, "media.send")
         client = await require_authorized_client(state, account)
         file_value, cleanup = decode_upload_file(
             params.get("file_path"),
@@ -1376,6 +1630,7 @@ async def dispatch_rpc(state: ApiState, method: str, params: dict[str, Any]) -> 
         return {"type": type(result).__name__, "object": serialize_tl(result)}
     if method == "raw.invoke":
         ensure_raw_enabled(state)
+        ensure_telegram_rate(state, account, "raw.invoke")
         layer = await state.require_layer(account)
         client = await layer.authorized_client()
         request = await build_tl_request(params["request"], params.get("kwargs", {}), client)
@@ -1385,7 +1640,15 @@ async def dispatch_rpc(state: ApiState, method: str, params: dict[str, Any]) -> 
 
 
 async def run_queue_job(state: ApiState, job_id: str, payload: QueueJobPayload) -> None:
-    await state.queue.update_job(job_id, status="running")
+    job = await state.queue.get_job(job_id)
+    if job and job.get("status") == "queued":
+        await state.queue.update_job(
+            job_id,
+            status="running",
+            attempts=int(job.get("attempts") or 0) + 1,
+        )
+    else:
+        await state.queue.update_job(job_id, status="running")
     try:
         result = await dispatch_rpc(
             state,
@@ -1394,7 +1657,13 @@ async def run_queue_job(state: ApiState, job_id: str, payload: QueueJobPayload) 
         )
         await state.queue.update_job(job_id, result=result, status="done")
     except Exception as exc:
-        await state.queue.update_job(job_id, error=str(exc), status="failed")
+        job = await state.queue.get_job(job_id)
+        attempts = int((job or {}).get("attempts") or 0)
+        max_attempts = int((job or {}).get("max_attempts") or 1)
+        if attempts < max_attempts:
+            await state.queue.requeue_job(job_id, error=str(exc))
+        else:
+            await state.queue.dead_letter_job(job_id, error=str(exc))
 
 
 async def run_queue_worker(state: ApiState, *, poll_timeout: int = 5) -> None:
@@ -1420,8 +1689,20 @@ RPC_METHODS = {
     "messages.edit",
     "messages.forward",
     "messages.send",
+    "messages.send_username",
     "raw.invoke",
     "tl.construct",
+}
+
+
+BOT_API_COMPAT_METHODS = {
+    "deleteMessage",
+    "editMessageText",
+    "getMe",
+    "getUpdates",
+    "sendDocument",
+    "sendMessage",
+    "sendPhoto",
 }
 
 
@@ -1574,10 +1855,21 @@ def serialize_user(user: User | None) -> dict[str, Any]:
 
 
 def serialize_dialog(dialog: Dialog) -> dict[str, Any]:
+    entity = getattr(dialog, "entity", None)
+    input_entity = None
+    if entity is not None:
+        try:
+            input_entity = utils.get_input_peer(entity)
+        except TypeError:
+            input_entity = None
     return {
         "id": dialog.id,
         "name": dialog.name,
         "title": dialog.title,
+        "username": getattr(entity, "username", None),
+        "entity_type": type(entity).__name__ if entity is not None else None,
+        "access_hash": getattr(entity, "access_hash", None),
+        "input_entity": serialize_tl(input_entity) if input_entity is not None else None,
         "is_user": dialog.is_user,
         "is_group": dialog.is_group,
         "is_channel": dialog.is_channel,
@@ -1596,4 +1888,3 @@ def serialize_message(message: Message) -> dict[str, Any]:
         "mentioned": message.mentioned,
         "media": type(message.media).__name__ if message.media else None,
     }
-

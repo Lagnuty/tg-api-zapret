@@ -1,10 +1,11 @@
-# tg-api-zapret 0.4.0 implemented API surfaces
+# tg-api-zapret 0.4.4 implemented API surfaces
 
 ## Compatibility levels
 
 - Level A: Bot API compatibility endpoint is implemented at `/bot{token}/{method}`.
   Supported methods: `getMe`, `getUpdates`, `sendMessage`, `sendPhoto`, `sendDocument`,
-  `editMessageText`, `deleteMessage`.
+  `editMessageText`, `deleteMessage`. This is a compatibility layer, not a full Telegram
+  Bot API proxy.
 - Level B: Reverse-proxy/DNS compatibility information is exposed at `/compat/reverse-proxy`.
   This is for applications that already use Telegram Bot API HTTPS and can change base URL,
   DNS, or reverse-proxy routing.
@@ -29,6 +30,8 @@
 6. CORS middleware: implemented from `service.cors_origins`.
 7. Request timeout middleware: implemented from `service.request_timeout_seconds`.
 8. Production queue workers: Redis queues are no longer executed inside the API process.
+   Redis jobs include idempotency keys, attempts/max attempts, leases, retry, and dead-letter
+   state for exhausted jobs.
    Start workers with:
 
 ```bash

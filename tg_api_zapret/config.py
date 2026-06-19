@@ -17,8 +17,8 @@ OFFICIAL_DESKTOP_API_HASH = "b18441a1ff607e10a989891a5462e627"
 class TelegramConfig:
     api_id: int = OFFICIAL_DESKTOP_API_ID
     api_hash: str = OFFICIAL_DESKTOP_API_HASH
-    device_model: str = "tg-api-zapret"
-    system_version: str = "Linux"
+    device_model: str = "Telegram Desktop"
+    system_version: str = "Linux x86_64"
     app_version: str = __version__
     lang_code: str = "en"
     system_lang_code: str = "en-US"
@@ -55,8 +55,8 @@ class TelegramConfig:
 
 @dataclass(frozen=True)
 class ClientProfile:
-    device_model: str = "tg-api-zapret"
-    system_version: str = "Linux"
+    device_model: str = "Telegram Desktop"
+    system_version: str = "Linux x86_64"
     app_version: str = __version__
     lang_code: str = "en"
     system_lang_code: str = "en-US"
@@ -94,21 +94,30 @@ class ServiceSettings:
     max_queue_jobs_list: int = 1000
     stream_queue_size: int = 100
     request_timeout_seconds: int = 60
-    expose_docs: bool = True
+    expose_docs: bool = False
     cors_origins: list[str] = field(default_factory=list)
-    require_api_token: bool = False
+    require_api_token: bool = True
     api_token_env: str = "TG_API_TOKEN"
     api_tokens_env: str = "TG_API_TOKENS"
     rate_limit_per_minute: int = 120
     audit_log_path: str | None = None
-    enable_raw_invoke: bool = True
-    enable_layer_invoke: bool = True
+    enable_raw_invoke: bool = False
+    enable_layer_invoke: bool = False
     bot_token_accounts: dict[str, str] = field(default_factory=dict)
+    telegram_actions_per_minute: int = 20
+    telegram_auth_requests_per_hour: int = 3
+    max_dialog_limit: int = 100
+    max_message_limit: int = 100
+    blocked_account_names: list[str] = field(default_factory=lambda: ["string", "account"])
+    telegram_min_action_interval_seconds: float = 1.25
+    queue_visibility_timeout_seconds: int = 300
+    queue_default_max_attempts: int = 3
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "ServiceSettings":
         if not data:
             return cls()
+        defaults = cls()
         return cls(
             api_name=data.get("api_name") or cls.api_name,
             public_base_url=data.get("public_base_url") or None,
@@ -134,6 +143,30 @@ class ServiceSettings:
                 str(token): normalize_account_name(account)
                 for token, account in dict(data.get("bot_token_accounts") or {}).items()
             },
+            telegram_actions_per_minute=int(
+                data.get("telegram_actions_per_minute", cls.telegram_actions_per_minute)
+            ),
+            telegram_auth_requests_per_hour=int(
+                data.get("telegram_auth_requests_per_hour", cls.telegram_auth_requests_per_hour)
+            ),
+            max_dialog_limit=int(data.get("max_dialog_limit", cls.max_dialog_limit)),
+            max_message_limit=int(data.get("max_message_limit", cls.max_message_limit)),
+            blocked_account_names=[
+                normalize_account_name(item)
+                for item in data.get("blocked_account_names", defaults.blocked_account_names)
+            ],
+            telegram_min_action_interval_seconds=float(
+                data.get(
+                    "telegram_min_action_interval_seconds",
+                    cls.telegram_min_action_interval_seconds,
+                )
+            ),
+            queue_visibility_timeout_seconds=int(
+                data.get("queue_visibility_timeout_seconds", cls.queue_visibility_timeout_seconds)
+            ),
+            queue_default_max_attempts=int(
+                data.get("queue_default_max_attempts", cls.queue_default_max_attempts)
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -155,6 +188,14 @@ class ServiceSettings:
             "enable_raw_invoke": self.enable_raw_invoke,
             "enable_layer_invoke": self.enable_layer_invoke,
             "bot_token_accounts": self.bot_token_accounts,
+            "telegram_actions_per_minute": self.telegram_actions_per_minute,
+            "telegram_auth_requests_per_hour": self.telegram_auth_requests_per_hour,
+            "max_dialog_limit": self.max_dialog_limit,
+            "max_message_limit": self.max_message_limit,
+            "blocked_account_names": self.blocked_account_names,
+            "telegram_min_action_interval_seconds": self.telegram_min_action_interval_seconds,
+            "queue_visibility_timeout_seconds": self.queue_visibility_timeout_seconds,
+            "queue_default_max_attempts": self.queue_default_max_attempts,
         }
 
 

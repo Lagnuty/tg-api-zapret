@@ -155,7 +155,7 @@ HTTP API.
 
 ## Имя в авторизованных приложениях Telegram
 
-По умолчанию прослойка авторизуется с `device_model=tg-api-zapret` и
+По умолчанию прослойка авторизуется с `device_model=Telegram Desktop` и
 `app_version`, равным текущей версии `tg-api-zapret`. Это имя Telegram обычно
 показывает в списке активных устройств.
 
@@ -163,9 +163,9 @@ HTTP API.
 
 ```bash
 python -m tg_api_zapret set-client-profile \
-  --device-model tg-api-zapret \
-  --system-version Ubuntu \
-  --app-version 0.4.0
+  --device-model "Telegram Desktop" \
+  --system-version "Linux x86_64" \
+  --app-version 0.4.4
 ```
 
 Для уже существующей сессии Telegram может оставить старое название. Надежный
@@ -212,6 +212,29 @@ python -m tg_api_zapret clear-proxy
 
 ## HTTP API
 
+Current secure defaults:
+
+- `require_api_token=true`; set `TG_API_TOKEN` or `TG_API_TOKENS` before calling any endpoint except `/health`.
+- `expose_docs=false`; `/docs`, `/redoc`, and `/openapi.json` are hidden until enabled in `/app/settings`.
+- `enable_raw_invoke=false` and `enable_layer_invoke=false`; enable them explicitly only for trusted admin use.
+- `GET /dialogs` includes `username`, `access_hash`, and `input_entity` when Telethon has enough data. Clients should prefer `username`; if only a numeric id is available, use `input_entity` so `access_hash` is preserved.
+
+Minimal local run:
+
+```bash
+export TG_API_TOKEN='dev-admin-token'
+python -m tg_api_zapret api --host 127.0.0.1 --port 8080
+```
+
+Start a new chat by username, even when the dialog is not in `/dialogs` yet:
+
+```bash
+curl -X POST http://127.0.0.1:8080/messages/send-username \
+  -H 'Authorization: Bearer dev-admin-token' \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"username_or_@username","text":"hello"}'
+```
+
 Запуск API:
 
 ```bash
@@ -240,9 +263,23 @@ http://127.0.0.1:8080/docs
 - `GET /dialogs`
 - `GET /messages/{entity}`
 - `POST /messages/send`
+- `POST /messages/send-username`
 - `POST /messages/edit`
 - `POST /messages/delete`
 - `POST /messages/forward`
+- `POST /messages/history/delete`
+- `POST /messages/reaction`
+- `POST /media/send`
+- `POST /media/download`
+- `POST /files/upload`
+- `POST /entities/resolve`
+- `POST /chats/join`
+- `POST /chats/leave`
+- `POST /stories/get`
+- `POST /stories/send`
+- `POST /admin/ban`
+- `POST /admin/promote`
+- `POST /tl/construct`
 - `POST /raw/invoke`
 - `GET /mtproto/layers/{layer}/functions`
 - `POST /mtproto/layers/{layer}/invoke`
@@ -501,8 +538,15 @@ curl -X POST http://127.0.0.1:8080/rpc \
 - `accounts.list`
 - `auth.status`
 - `dialogs.list`
+- `entities.resolve`
+- `media.send`
+- `messages.delete`
+- `messages.edit`
+- `messages.forward`
 - `messages.send`
+- `messages.send_username`
 - `raw.invoke`
+- `tl.construct`
 
 ## Queue API
 
@@ -545,6 +589,22 @@ Redis выбран как первый production backend: для текущег
 статусы задач и быстро поднимать сервис без сложной инфраструктуры. RabbitMQ/NATS
 можно добавить позже тем же backend-интерфейсом, если понадобится отдельный
 кластер воркеров или pub/sub-шина.
+
+## Queue API 0.4.4 Details
+
+Current queue semantics:
+
+- memory backend is for local development and runs jobs inside the API process;
+- Redis backend stores jobs durably and workers run jobs outside the API process;
+- Redis jobs support `idempotency_key`, `attempts`, `max_attempts`, `leased_until`, retry, and `dead_letter`;
+- expired Redis leases are requeued until `max_attempts`, then moved to dead-letter state.
+
+## Bot API Compatibility Limits
+
+`/bot{token}/{method}` is a compatibility layer, not a full Telegram Bot API proxy.
+Implemented methods are `getMe`, `getUpdates`, `sendMessage`, `sendPhoto`, `sendDocument`,
+`editMessageText`, and `deleteMessage`. For everything else use native REST wrappers,
+JSON-RPC, or raw MTProto after explicitly enabling raw invoke.
 
 ## Python SDK API
 
