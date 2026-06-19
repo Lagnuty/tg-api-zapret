@@ -37,9 +37,8 @@ class TelegramLayer:
         if self._client and self._client.is_connected():
             return self
 
-        session_string = self.session_backend.load()
         self._client = TelegramClient(
-            StringSession(session_string),
+            self.session_backend.client_session(),
             self.config.api_id,
             self.config.api_hash,
             device_model=self.config.device_model,

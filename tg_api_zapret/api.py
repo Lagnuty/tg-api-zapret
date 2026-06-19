@@ -37,7 +37,7 @@ from tg_api_zapret.config import (
 )
 from tg_api_zapret.mtproto_layers import get_layer_functions, require_layer_function
 from tg_api_zapret.queue_backends import QueueBackend, build_queue_backend
-from tg_api_zapret.sessions import FileSessionBackend, SQLiteSessionBackend
+from tg_api_zapret.sessions import FileSessionBackend, SQLiteSessionBackend, TelethonSessionFileBackend
 from tg_api_zapret.tl_codec import (
     build_tl_object,
     build_tl_request,
@@ -113,7 +113,11 @@ class ApiState:
         if self.session_db:
             backend = SQLiteSessionBackend(self.session_db, account_name)
         else:
-            backend = FileSessionBackend(resolve_session_file(self.session_file, account_name))
+            session_path = resolve_session_file(self.session_file, account_name)
+            if account_name == "default" and session_path.suffix == ".session":
+                backend = TelethonSessionFileBackend(session_path)
+            else:
+                backend = FileSessionBackend(session_path)
         layer = TelegramLayer(
             TelegramConfig.from_env(
                 proxy_url=settings.proxy_url,

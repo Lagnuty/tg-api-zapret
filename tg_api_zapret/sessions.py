@@ -5,9 +5,15 @@ import base64
 import os
 from pathlib import Path
 import sqlite3
+from typing import Any
+
+from telethon.sessions import StringSession
 
 
 class SessionBackend(ABC):
+    def client_session(self) -> Any:
+        return StringSession(self.load())
+
     @abstractmethod
     def load(self) -> str | None:
         raise NotImplementedError
@@ -56,6 +62,20 @@ class FileSessionBackend(SessionBackend):
             self.path.chmod(0o600)
         except OSError:
             pass
+
+
+class TelethonSessionFileBackend(SessionBackend):
+    def __init__(self, path: str | Path) -> None:
+        self.path = Path(path).expanduser()
+
+    def client_session(self) -> str:
+        return str(self.path)
+
+    def load(self) -> str | None:
+        return None
+
+    def save(self, session_string: str) -> None:
+        return None
 
 
 class SQLiteSessionBackend(SessionBackend):
@@ -108,4 +128,3 @@ def encode_session_for_transport(session_string: str) -> str:
 
 def decode_session_from_transport(value: str) -> str:
     return base64.urlsafe_b64decode(value.encode("ascii")).decode("utf-8")
-

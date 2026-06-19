@@ -20,7 +20,7 @@ from tg_api_zapret.config import (
     normalize_account_name,
     validate_proxy_url,
 )
-from tg_api_zapret.sessions import FileSessionBackend, SQLiteSessionBackend
+from tg_api_zapret.sessions import FileSessionBackend, SQLiteSessionBackend, TelethonSessionFileBackend
 from tg_api_zapret.version import __version__
 
 
@@ -337,7 +337,11 @@ def build_layer(args: argparse.Namespace, settings: AppSettings) -> TelegramLaye
     if args.session_db:
         backend = SQLiteSessionBackend(Path(args.session_db), account)
     else:
-        backend = FileSessionBackend(resolve_session_file(args.session_file, account))
+        session_path = resolve_session_file(args.session_file, account)
+        if account == "default" and session_path.suffix == ".session":
+            backend = TelethonSessionFileBackend(session_path)
+        else:
+            backend = FileSessionBackend(session_path)
     return TelegramLayer(
         TelegramConfig.from_env(
             proxy_url=settings.proxy_url,

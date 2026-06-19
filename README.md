@@ -165,7 +165,7 @@ HTTP API.
 python -m tg_api_zapret set-client-profile \
   --device-model "Telegram Desktop" \
   --system-version "Linux x86_64" \
-  --app-version 0.4.6
+  --app-version 0.4.7
 ```
 
 Для уже существующей сессии Telegram может оставить старое название. Надежный
@@ -224,6 +224,14 @@ Minimal local run:
 ```bash
 export TG_API_TOKEN='dev-admin-token'
 python -m tg_api_zapret api --host 127.0.0.1 --port 8080
+```
+
+Existing native Telethon `.session` files can be used directly as the default account:
+
+```bash
+export TG_API_TOKEN='dev-admin-token'
+python -m tg_api_zapret --session-file '/opt/tg-api-zapret/sessions/241643392_telethon.session' api --host 0.0.0.0 --port 8081
+curl http://127.0.0.1:8081/auth/status -H 'Authorization: Bearer dev-admin-token'
 ```
 
 Start a new chat by username, even when the dialog is not in `/dialogs` yet:
