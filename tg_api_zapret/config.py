@@ -112,6 +112,16 @@ class ServiceSettings:
     telegram_min_action_interval_seconds: float = 1.25
     queue_visibility_timeout_seconds: int = 300
     queue_default_max_attempts: int = 3
+    keep_accounts_online: bool = True
+    online_update_interval_seconds: int = 55
+    auto_connect_accounts: list[str] = field(default_factory=list)
+    reconnect_enabled: bool = True
+    reconnect_min_delay_seconds: int = 5
+    reconnect_max_delay_seconds: int = 60
+    passive_update_receiver: bool = True
+    entity_cache_warmup_dialogs: int = 50
+    require_connection_health_before_auth: bool = True
+    connection_health_timeout_seconds: int = 20
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "ServiceSettings":
@@ -167,6 +177,39 @@ class ServiceSettings:
             queue_default_max_attempts=int(
                 data.get("queue_default_max_attempts", cls.queue_default_max_attempts)
             ),
+            keep_accounts_online=bool(data.get("keep_accounts_online", cls.keep_accounts_online)),
+            online_update_interval_seconds=int(
+                data.get("online_update_interval_seconds", cls.online_update_interval_seconds)
+            ),
+            auto_connect_accounts=[
+                normalize_account_name(item)
+                for item in data.get("auto_connect_accounts", defaults.auto_connect_accounts)
+            ],
+            reconnect_enabled=bool(data.get("reconnect_enabled", cls.reconnect_enabled)),
+            reconnect_min_delay_seconds=int(
+                data.get("reconnect_min_delay_seconds", cls.reconnect_min_delay_seconds)
+            ),
+            reconnect_max_delay_seconds=int(
+                data.get("reconnect_max_delay_seconds", cls.reconnect_max_delay_seconds)
+            ),
+            passive_update_receiver=bool(
+                data.get("passive_update_receiver", cls.passive_update_receiver)
+            ),
+            entity_cache_warmup_dialogs=int(
+                data.get("entity_cache_warmup_dialogs", cls.entity_cache_warmup_dialogs)
+            ),
+            require_connection_health_before_auth=bool(
+                data.get(
+                    "require_connection_health_before_auth",
+                    cls.require_connection_health_before_auth,
+                )
+            ),
+            connection_health_timeout_seconds=int(
+                data.get(
+                    "connection_health_timeout_seconds",
+                    cls.connection_health_timeout_seconds,
+                )
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -196,6 +239,16 @@ class ServiceSettings:
             "telegram_min_action_interval_seconds": self.telegram_min_action_interval_seconds,
             "queue_visibility_timeout_seconds": self.queue_visibility_timeout_seconds,
             "queue_default_max_attempts": self.queue_default_max_attempts,
+            "keep_accounts_online": self.keep_accounts_online,
+            "online_update_interval_seconds": self.online_update_interval_seconds,
+            "auto_connect_accounts": self.auto_connect_accounts,
+            "reconnect_enabled": self.reconnect_enabled,
+            "reconnect_min_delay_seconds": self.reconnect_min_delay_seconds,
+            "reconnect_max_delay_seconds": self.reconnect_max_delay_seconds,
+            "passive_update_receiver": self.passive_update_receiver,
+            "entity_cache_warmup_dialogs": self.entity_cache_warmup_dialogs,
+            "require_connection_health_before_auth": self.require_connection_health_before_auth,
+            "connection_health_timeout_seconds": self.connection_health_timeout_seconds,
         }
 
 

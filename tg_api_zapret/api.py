@@ -78,6 +78,28 @@ class ApiState:
         self.bot_updates: dict[str, list[dict[str, Any]]] = {}
         self.bot_update_ids: dict[str, int] = {}
         self.bot_update_handlers: dict[str, tuple[Any, Any]] = {}
+        self.online_tasks: dict[str, asyncio.Task[None]] = {}
+        self.online_status: dict[str, dict[str, Any]] = {}
+        self.reconnect_tasks: dict[str, asyncio.Task[None]] = {}
+        self.update_handlers: dict[str, tuple[Any, Any]] = {}
+        self.entity_cache: dict[str, dict[str, dict[str, Any]]] = {}
+        self.connection_health: dict[str, dict[str, Any]] = {}
+
+    async def startup(self) -> None:
+        service = self.settings().service
+        for account in service.auto_connect_accounts:
+            try:
+                layer = await self.connect(account)
+                if await layer.is_authorized():
+                    await self.activate_desktop_like_runtime(account)
+            except Exception as exc:
+                account_name = normalize_account_name(account)
+                self.connection_health[account_name] = {
+                    "account": account_name,
+                    "ok": False,
+                    "error": str(exc),
+                    "last_check_ts": int(time.time()),
+                }
 
     def settings(self) -> AppSettings:
         return AppSettings.load(self.config_file)
@@ -103,16 +125,27 @@ class ApiState:
         self.layers[account_name] = layer
         if account_name not in settings.accounts:
             self.save_settings(settings.with_account(account_name))
+        if settings.service.keep_accounts_online and await layer.is_authorized():
+            await self.activate_desktop_like_runtime(account_name)
         return layer
 
     async def disconnect(self, account: str | None = None) -> None:
         if account is None:
+            for account_name in list(self.online_tasks):
+                await self.stop_online_keepalive(account_name)
+            for account_name in list(self.reconnect_tasks):
+                await self.stop_reconnect_loop(account_name)
+            for account_name in list(self.update_handlers):
+                await self.stop_passive_update_receiver(account_name)
             for layer in self.layers.values():
                 await layer.disconnect()
             self.layers.clear()
             await self.queue.close()
             return
         account_name = self.resolve_account(account)
+        await self.stop_online_keepalive(account_name)
+        await self.stop_reconnect_loop(account_name)
+        await self.stop_passive_update_receiver(account_name)
         layer = self.layers.pop(account_name, None)
         if layer:
             await layer.disconnect()
@@ -134,6 +167,216 @@ class ApiState:
             )
         return account_name
 
+    def start_online_keepalive(self, account: str) -> None:
+        account_name = self.resolve_account(account)
+        task = self.online_tasks.get(account_name)
+        if task and not task.done():
+            return
+        self.online_tasks[account_name] = asyncio.create_task(self._online_keepalive_loop(account_name))
+
+    async def activate_desktop_like_runtime(self, account: str) -> None:
+        account_name = self.resolve_account(account)
+        service = self.settings().service
+        if service.keep_accounts_online:
+            self.start_online_keepalive(account_name)
+        if service.passive_update_receiver:
+            await self.start_passive_update_receiver(account_name)
+        if service.entity_cache_warmup_dialogs > 0:
+            await self.warm_entity_cache(account_name, limit=service.entity_cache_warmup_dialogs)
+        if service.reconnect_enabled:
+            self.start_reconnect_loop(account_name)
+
+    async def stop_online_keepalive(self, account: str) -> None:
+        account_name = self.resolve_account(account)
+        task = self.online_tasks.pop(account_name, None)
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        layer = self.layers.get(account_name)
+        if layer and await layer.is_authorized():
+            try:
+                client = await layer.authorized_client()
+                await client(functions.account.UpdateStatusRequest(offline=True))
+            except Exception:
+                pass
+        self.online_status[account_name] = {
+            "account": account_name,
+            "keep_online": False,
+            "last_update_ts": int(time.time()),
+        }
+
+    async def _online_keepalive_loop(self, account: str) -> None:
+        while True:
+            interval = max(15, self.settings().service.online_update_interval_seconds)
+            try:
+                layer = await self.require_layer(account)
+                if await layer.is_authorized():
+                    client = await layer.authorized_client()
+                    await client(functions.account.UpdateStatusRequest(offline=False))
+                    self.online_status[account] = {
+                        "account": account,
+                        "keep_online": True,
+                        "connected": client.is_connected(),
+                        "last_update_ts": int(time.time()),
+                        "interval_seconds": interval,
+                    }
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.online_status[account] = {
+                    "account": account,
+                    "keep_online": True,
+                    "error": str(exc),
+                    "last_update_ts": int(time.time()),
+                    "interval_seconds": interval,
+                }
+            await asyncio.sleep(interval)
+
+    def start_reconnect_loop(self, account: str) -> None:
+        account_name = self.resolve_account(account)
+        task = self.reconnect_tasks.get(account_name)
+        if task and not task.done():
+            return
+        self.reconnect_tasks[account_name] = asyncio.create_task(self._reconnect_loop(account_name))
+
+    async def stop_reconnect_loop(self, account: str) -> None:
+        account_name = self.resolve_account(account)
+        task = self.reconnect_tasks.pop(account_name, None)
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
+    async def _reconnect_loop(self, account: str) -> None:
+        delay = self.settings().service.reconnect_min_delay_seconds
+        while True:
+            service = self.settings().service
+            min_delay = max(1, service.reconnect_min_delay_seconds)
+            max_delay = max(min_delay, service.reconnect_max_delay_seconds)
+            try:
+                layer = await self.require_layer(account)
+                client = await layer.authorized_client()
+                if not client.is_connected():
+                    await layer.connect()
+                if await layer.is_authorized():
+                    if service.keep_accounts_online:
+                        self.start_online_keepalive(account)
+                    if service.passive_update_receiver and account not in self.update_handlers:
+                        await self.start_passive_update_receiver(account)
+                    self.connection_health[account] = {
+                        "account": account,
+                        "ok": True,
+                        "connected": client.is_connected(),
+                        "last_check_ts": int(time.time()),
+                    }
+                delay = min_delay
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.connection_health[account] = {
+                    "account": account,
+                    "ok": False,
+                    "error": str(exc),
+                    "last_check_ts": int(time.time()),
+                    "next_retry_seconds": delay,
+                }
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, max_delay)
+                continue
+            await asyncio.sleep(max(min_delay, delay))
+
+    async def start_passive_update_receiver(self, account: str) -> None:
+        account_name = self.resolve_account(account)
+        if account_name in self.update_handlers:
+            return
+        layer = await self.require_layer(account_name)
+        if not await layer.is_authorized():
+            return
+        client = await layer.authorized_client()
+
+        async def handler(event: Any) -> None:
+            self.online_status.setdefault(account_name, {})
+            self.online_status[account_name].update(
+                {
+                    "account": account_name,
+                    "last_update_ts": int(time.time()),
+                    "last_update_type": type(event).__name__,
+                    "passive_receiver": True,
+                }
+            )
+
+        builder = events.Raw()
+        client.add_event_handler(handler, builder)
+        self.update_handlers[account_name] = (handler, builder)
+
+    async def stop_passive_update_receiver(self, account: str) -> None:
+        account_name = self.resolve_account(account)
+        handler_tuple = self.update_handlers.pop(account_name, None)
+        layer = self.layers.get(account_name)
+        if not handler_tuple or not layer:
+            return
+        try:
+            client = await layer.authorized_client()
+            handler, builder = handler_tuple
+            client.remove_event_handler(handler, builder)
+        except Exception:
+            pass
+
+    async def warm_entity_cache(self, account: str, *, limit: int) -> dict[str, Any]:
+        account_name = self.resolve_account(account)
+        layer = await self.require_layer(account_name)
+        dialogs = await layer.get_dialogs(limit=limit)
+        cache: dict[str, dict[str, Any]] = {}
+        for dialog in dialogs:
+            serialized = serialize_dialog(dialog)
+            cache[str(serialized["id"])] = serialized
+            username = serialized.get("username")
+            if username:
+                cache[f"@{username}".lower()] = serialized
+                cache[str(username).lower()] = serialized
+        self.entity_cache[account_name] = cache
+        return {
+            "account": account_name,
+            "cached": len(cache),
+            "dialog_limit": limit,
+            "last_warmup_ts": int(time.time()),
+        }
+
+    async def check_connection_health(self, account: str | None = None) -> dict[str, Any]:
+        account_name = self.resolve_account(account)
+        timeout = self.settings().service.connection_health_timeout_seconds
+        try:
+            layer = await asyncio.wait_for(self.require_layer(account_name), timeout=timeout)
+            connected = await asyncio.wait_for(layer.is_connected(), timeout=timeout)
+            result = {
+                "account": account_name,
+                "ok": connected,
+                "connected": connected,
+                "last_check_ts": int(time.time()),
+            }
+        except Exception as exc:
+            result = {
+                "account": account_name,
+                "ok": False,
+                "error": str(exc),
+                "last_check_ts": int(time.time()),
+            }
+        self.connection_health[account_name] = result
+        if not result["ok"]:
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "message": "Telegram connection health check failed; auth request blocked",
+                    "health": result,
+                },
+            )
+        return result
+
 
 class ProxyPayload(BaseModel):
     proxy_url: str | None = None
@@ -141,6 +384,11 @@ class ProxyPayload(BaseModel):
 
 class AccountPayload(BaseModel):
     account: str
+
+
+class AccountConnectPayload(BaseModel):
+    account: str | None = None
+    keep_online: bool = True
 
 
 class ClientProfilePayload(BaseModel):
@@ -179,6 +427,16 @@ class ServiceSettingsPayload(BaseModel):
     telegram_min_action_interval_seconds: float = Field(default=1.25, ge=0)
     queue_visibility_timeout_seconds: int = Field(default=300, ge=1)
     queue_default_max_attempts: int = Field(default=3, ge=1)
+    keep_accounts_online: bool = True
+    online_update_interval_seconds: int = Field(default=55, ge=15)
+    auto_connect_accounts: list[str] = Field(default_factory=list)
+    reconnect_enabled: bool = True
+    reconnect_min_delay_seconds: int = Field(default=5, ge=1)
+    reconnect_max_delay_seconds: int = Field(default=60, ge=1)
+    passive_update_receiver: bool = True
+    entity_cache_warmup_dialogs: int = Field(default=50, ge=0)
+    require_connection_health_before_auth: bool = True
+    connection_health_timeout_seconds: int = Field(default=20, ge=1)
 
 
 class SendCodePayload(BaseModel):
@@ -350,6 +608,7 @@ def create_app(state: ApiState) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         try:
+            await state.startup()
             yield
         finally:
             await state.disconnect()
@@ -455,6 +714,12 @@ def create_app(state: ApiState) -> FastAPI:
                     "description": "Simple request/response commands.",
                     "endpoints": [
                         "GET /dialogs",
+                        "POST /accounts/connect",
+                        "POST /accounts/disconnect",
+                        "GET /accounts/online",
+                        "GET /accounts/health",
+                        "POST /accounts/entity-cache/warm",
+                        "GET /accounts/entity-cache",
                         "POST /messages/send",
                         "POST /messages/send-username",
                         "POST /messages/edit",
@@ -646,6 +911,77 @@ def create_app(state: ApiState) -> FastAPI:
         state.save_settings(settings)
         return {"active_account": settings.active_account, "accounts": settings.accounts}
 
+    @app.post("/accounts/connect")
+    async def connect_account(payload: AccountConnectPayload) -> dict[str, Any]:
+        account_name = state.resolve_account(payload.account)
+        layer = await state.require_layer(account_name)
+        authorized = await layer.is_authorized()
+        if payload.keep_online and authorized:
+            await state.activate_desktop_like_runtime(account_name)
+        return {
+            "account": account_name,
+            "connected": True,
+            "authorized": authorized,
+            "keep_online": payload.keep_online and authorized,
+            "online_status": state.online_status.get(account_name),
+        }
+
+    @app.post("/accounts/disconnect")
+    async def disconnect_account(payload: AccountConnectPayload) -> dict[str, Any]:
+        account_name = state.resolve_account(payload.account)
+        await state.disconnect(account_name)
+        return {"account": account_name, "connected": False, "keep_online": False}
+
+    @app.get("/accounts/online")
+    async def online_accounts() -> dict[str, Any]:
+        return {
+            "keep_accounts_online": state.settings().service.keep_accounts_online,
+            "accounts": state.online_status,
+            "connection_health": state.connection_health,
+            "running_tasks": sorted(
+                account for account, task in state.online_tasks.items() if not task.done()
+            ),
+            "reconnect_tasks": sorted(
+                account for account, task in state.reconnect_tasks.items() if not task.done()
+            ),
+            "passive_receivers": sorted(state.update_handlers),
+        }
+
+    @app.get("/accounts/health")
+    async def account_health(account: str | None = None) -> dict[str, Any]:
+        if account is not None:
+            return await state.check_connection_health(account)
+        results: dict[str, Any] = {}
+        for account_name in state.settings().accounts:
+            try:
+                results[account_name] = await state.check_connection_health(account_name)
+            except HTTPException as exc:
+                results[account_name] = {
+                    "account": account_name,
+                    "ok": False,
+                    "status_code": exc.status_code,
+                    "error": exc.detail,
+                }
+        return {"accounts": results}
+
+    @app.post("/accounts/entity-cache/warm")
+    async def warm_account_entity_cache(
+        account: str | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        limit = clamp_limit(limit, state.settings().service.max_dialog_limit)
+        return await state.warm_entity_cache(state.resolve_account(account), limit=limit)
+
+    @app.get("/accounts/entity-cache")
+    async def account_entity_cache(account: str | None = None) -> dict[str, Any]:
+        account_name = state.resolve_account(account)
+        entities = state.entity_cache.get(account_name, {})
+        return {
+            "account": account_name,
+            "count": len(entities),
+            "entities": entities,
+        }
+
     @app.put("/config/proxy")
     async def set_proxy(payload: ProxyPayload) -> dict[str, Any]:
         if payload.proxy_url:
@@ -671,6 +1007,8 @@ def create_app(state: ApiState) -> FastAPI:
     @app.post("/auth/send-code")
     async def send_code(payload: SendCodePayload, account: str | None = None) -> dict[str, str]:
         ensure_telegram_auth_rate(state, account)
+        if state.settings().service.require_connection_health_before_auth:
+            await state.check_connection_health(state.resolve_account(account))
         layer = await state.require_layer(account)
         sent = await layer.send_code(payload.phone)
         return {
@@ -690,6 +1028,7 @@ def create_app(state: ApiState) -> FastAPI:
             )
         except SessionPasswordNeededError:
             return {"status": "password_required"}
+        await state.activate_desktop_like_runtime(state.resolve_account(account))
         return {"status": "authorized"}
 
     @app.post("/auth/password")
@@ -700,6 +1039,7 @@ def create_app(state: ApiState) -> FastAPI:
             await layer.sign_in_password(payload.password)
         except PasswordHashInvalidError as exc:
             raise HTTPException(status_code=400, detail="Invalid two-step password") from exc
+        await state.activate_desktop_like_runtime(state.resolve_account(account))
         return {"status": "authorized"}
 
     @app.get("/me")

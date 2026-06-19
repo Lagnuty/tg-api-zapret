@@ -55,8 +55,10 @@ def test_capabilities_show_full_rpc_methods(tmp_path, monkeypatch) -> None:
     client = TestClient(app)
 
     response = client.get("/capabilities", headers={"Authorization": "Bearer secret"})
-    methods = response.json()["interfaces"]["json_rpc"]["methods"]
+    data = response.json()
+    methods = data["interfaces"]["json_rpc"]["methods"]
     bot_methods = response.json()["interfaces"]["bot_api_compat"]["methods"]
+    rest_endpoints = data["interfaces"]["rest"]["endpoints"]
 
     assert "messages.edit" in methods
     assert "media.send" in methods
@@ -64,6 +66,11 @@ def test_capabilities_show_full_rpc_methods(tmp_path, monkeypatch) -> None:
     assert "tl.construct" in methods
     assert "sendMessage" in bot_methods
     assert "getUpdates" in bot_methods
+    assert "POST /accounts/connect" in rest_endpoints
+    assert "GET /accounts/online" in rest_endpoints
+    assert "GET /accounts/health" in rest_endpoints
+    assert "POST /accounts/entity-cache/warm" in rest_endpoints
+    assert "GET /accounts/entity-cache" in rest_endpoints
 
 
 def test_dialog_serializer_includes_username_and_input_entity() -> None:

@@ -165,7 +165,7 @@ HTTP API.
 python -m tg_api_zapret set-client-profile \
   --device-model "Telegram Desktop" \
   --system-version "Linux x86_64" \
-  --app-version 0.4.4
+  --app-version 0.4.6
 ```
 
 Для уже существующей сессии Telegram может оставить старое название. Надежный
@@ -233,6 +233,22 @@ curl -X POST http://127.0.0.1:8080/messages/send-username \
   -H 'Authorization: Bearer dev-admin-token' \
   -H 'Content-Type: application/json' \
   -d '{"username":"username_or_@username","text":"hello"}'
+```
+
+Keep an authorized account connected and online until API shutdown or explicit disconnect.
+The desktop-like runtime also supports startup auto-connect, reconnect loops, passive MTProto
+update receivers, entity-cache warmup, and Telegram/proxy health checks before login code
+requests. Related endpoints: `GET /accounts/health`, `POST /accounts/entity-cache/warm`,
+`GET /accounts/entity-cache`.
+
+```bash
+curl -X POST http://127.0.0.1:8080/accounts/connect \
+  -H 'Authorization: Bearer dev-admin-token' \
+  -H 'Content-Type: application/json' \
+  -d '{"account":"main","keep_online":true}'
+
+curl http://127.0.0.1:8080/accounts/online \
+  -H 'Authorization: Bearer dev-admin-token'
 ```
 
 Запуск API:

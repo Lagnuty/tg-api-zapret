@@ -118,3 +118,10 @@ def test_partial_service_settings_uses_safety_defaults(tmp_path) -> None:
     assert loaded.service.rate_limit_per_minute == 10
     assert loaded.service.blocked_account_names == ["string", "account"]
     assert loaded.service.telegram_min_action_interval_seconds == 1.25
+    assert loaded.service.keep_accounts_online is True
+    assert loaded.service.online_update_interval_seconds == 55
+    assert loaded.service.auto_connect_accounts == []
+    assert loaded.service.reconnect_enabled is True
+    assert loaded.service.passive_update_receiver is True
+    assert loaded.service.entity_cache_warmup_dialogs == 50
+    assert loaded.service.require_connection_health_before_auth is True

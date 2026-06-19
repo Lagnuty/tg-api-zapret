@@ -75,6 +75,10 @@ class TelegramLayer:
         client = await self._require_client()
         return await client.is_user_authorized()
 
+    async def is_connected(self) -> bool:
+        client = await self._require_client()
+        return client.is_connected()
+
     async def send_code(self, phone: str) -> SentCode:
         client = await self._require_client()
         sent = await client.send_code_request(phone)

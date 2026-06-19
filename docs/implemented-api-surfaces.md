@@ -1,4 +1,4 @@
-# tg-api-zapret 0.4.4 implemented API surfaces
+# tg-api-zapret 0.4.6 implemented API surfaces
 
 ## Compatibility levels
 
@@ -32,11 +32,21 @@
 8. Production queue workers: Redis queues are no longer executed inside the API process.
    Redis jobs include idempotency keys, attempts/max attempts, leases, retry, and dead-letter
    state for exhausted jobs.
-   Start workers with:
 
-```bash
-python -m tg_api_zapret worker --redis-url redis://127.0.0.1:6379/0
-```
+## Telegram Desktop-like presence
+
+- Default client profile uses `device_model=Telegram Desktop` and `system_version=Linux x86_64`.
+- Authorized accounts can be kept connected with `POST /accounts/connect`.
+- Stored authorized accounts can be connected on API startup with `auto_connect_accounts`.
+- Connected authorized accounts can run a reconnect loop with bounded backoff.
+- A passive MTProto update receiver keeps the client subscribed to raw updates.
+- Entity cache warmup stores recent dialog usernames and input-entity data for faster reuse.
+- `GET /accounts/health` checks Telegram/proxy connectivity before sensitive auth flows.
+- Presence heartbeat uses MTProto `account.UpdateStatus(offline=False)` every
+  `online_update_interval_seconds` seconds while the API process is running.
+- `GET /accounts/online` reports heartbeat, reconnect, passive receiver, and health status.
+- `POST /accounts/entity-cache/warm` and `GET /accounts/entity-cache` manage the runtime cache.
+- `POST /accounts/disconnect` stops the heartbeat and disconnects the account.
 
 ## Redis queue mode
 
