@@ -118,6 +118,13 @@ def test_partial_service_settings_uses_safety_defaults(tmp_path) -> None:
     assert loaded.service.rate_limit_per_minute == 10
     assert loaded.service.blocked_account_names == ["string", "account"]
     assert loaded.service.telegram_min_action_interval_seconds == 1.25
+    assert loaded.service.telegram_safe_mode is True
+    assert loaded.service.telegram_serialize_account_actions is True
+    assert loaded.service.telegram_send_actions_per_minute == 6
+    assert loaded.service.telegram_raw_actions_per_minute == 3
+    assert loaded.service.telegram_join_actions_per_hour == 5
+    assert loaded.service.telegram_destructive_actions_per_hour == 10
+    assert loaded.service.telegram_default_flood_cooldown_seconds == 300
     assert loaded.service.keep_accounts_online is True
     assert loaded.service.online_update_interval_seconds == 55
     assert loaded.service.auto_connect_accounts == []

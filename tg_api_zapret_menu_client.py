@@ -456,8 +456,7 @@ def menu_messages(client: TgApiZapretMenuClient) -> None:
     if entity is None:
         return
     limit = ask_int("Message limit", 50, minimum=1)
-    path = f"/messages/{quote(json.dumps(entity, ensure_ascii=False) if isinstance(entity, dict) else str(entity), safe='')}"
-    messages = client.get(path, query={"limit": limit})
+    messages = client.post("/messages/list", {"entity": entity, "limit": limit})
     if isinstance(messages, list):
         print_messages(messages)
     else:
@@ -926,7 +925,11 @@ def main_menu(client: TgApiZapretMenuClient) -> None:
         except ApiError as exc:
             print(f"\nAPI error: {exc}")
             if exc.status_code == 401:
-                print("Tip: pass --token dev-admin-token or set TG_API_TOKEN/TG_API_TOKEN_CLIENT.")
+                detail_text = json.dumps(exc.detail, ensure_ascii=False) if exc.detail is not None else str(exc)
+                if "Missing or invalid API token" in detail_text:
+                    print("Tip: pass --token dev-admin-token or set TG_API_TOKEN/TG_API_TOKEN_CLIENT.")
+                elif "Telegram session is not authorized" in detail_text:
+                    print("Tip: check selected account and session file, or run Login by phone/code/2FA.")
             if exc.detail is not None:
                 print("\nDetail:")
                 print_json(exc.detail)

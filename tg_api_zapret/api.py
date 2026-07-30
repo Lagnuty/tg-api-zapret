@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import replace
 import hashlib
@@ -41,12 +41,15 @@ from tg_api_zapret.sessions import FileSessionBackend, SQLiteSessionBackend, Tel
 from tg_api_zapret.tl_codec import (
     build_tl_object,
     build_tl_request,
+    decode_tl_value,
     resolve_entity,
     serialize_tl,
 )
 from tg_api_zapret.version import __version__
 
 REQUEST_SCOPES: ContextVar[list[str] | None] = ContextVar("REQUEST_SCOPES", default=None)
+REQUEST_TELEGRAM_ACCOUNT: ContextVar[str | None] = ContextVar("REQUEST_TELEGRAM_ACCOUNT", default=None)
+REQUEST_TELEGRAM_ACTION: ContextVar[str | None] = ContextVar("REQUEST_TELEGRAM_ACTION", default=None)
 
 
 class ApiState:
@@ -73,7 +76,10 @@ class ApiState:
         )
         self.rate_limits: dict[str, list[float]] = {}
         self.telegram_rate_limits: dict[str, list[float]] = {}
+        self.media_download_semaphores: dict[str, asyncio.Semaphore] = {}
+        self.telegram_action_locks: dict[str, asyncio.Lock] = {}
         self.telegram_auth_rate_limits: dict[str, list[float]] = {}
+        self.telegram_cooldowns: dict[str, dict[str, Any]] = {}
         self.last_telegram_action_at: dict[str, float] = {}
         self.bot_updates: dict[str, list[dict[str, Any]]] = {}
         self.bot_update_ids: dict[str, int] = {}
@@ -161,7 +167,7 @@ class ApiState:
         return self.layers[account_name]
 
     def resolve_account(self, account: str | None = None) -> str:
-        account_name = normalize_account_name(account or self.settings().active_account or self.default_account)
+        account_name = normalize_account_name(account or self.default_account or self.settings().active_account)
         service = self.settings().service
         blocked = {normalize_account_name(item) for item in service.blocked_account_names}
         if account_name in blocked:
@@ -381,6 +387,34 @@ class ApiState:
             )
         return result
 
+    def media_download_semaphore(self, account: str | None = None) -> asyncio.Semaphore:
+        account_name = self.resolve_account(account)
+        limit = self.settings().service.telegram_media_download_concurrency
+        semaphore = self.media_download_semaphores.get(account_name)
+        if semaphore is None:
+            semaphore = asyncio.Semaphore(limit)
+            self.media_download_semaphores[account_name] = semaphore
+        return semaphore
+
+    def telegram_action_lock(self, account: str | None = None) -> asyncio.Lock:
+        account_name = self.resolve_account(account)
+        lock = self.telegram_action_locks.get(account_name)
+        if lock is None:
+            lock = asyncio.Lock()
+            self.telegram_action_locks[account_name] = lock
+        return lock
+
+    def record_flood_wait(self, account: str | None, action: str | None, seconds: int | None) -> None:
+        account_name = self.resolve_account(account)
+        retry_after = max(1, int(seconds or self.settings().service.telegram_default_flood_cooldown_seconds))
+        self.telegram_cooldowns[account_name] = {
+            "account": account_name,
+            "action": action or "unknown",
+            "retry_after_seconds": retry_after,
+            "until_ts": int(time.time() + retry_after),
+            "recorded_ts": int(time.time()),
+        }
+
 
 class ProxyPayload(BaseModel):
     proxy_url: str | None = None
@@ -424,11 +458,21 @@ class ServiceSettingsPayload(BaseModel):
     enable_layer_invoke: bool = False
     bot_token_accounts: dict[str, str] = Field(default_factory=dict)
     telegram_actions_per_minute: int = Field(default=20, ge=1)
+    telegram_safe_mode: bool = True
+    telegram_serialize_account_actions: bool = True
+    telegram_send_actions_per_minute: int = Field(default=6, ge=1)
+    telegram_resolve_actions_per_minute: int = Field(default=10, ge=1)
+    telegram_raw_actions_per_minute: int = Field(default=3, ge=1)
+    telegram_join_actions_per_hour: int = Field(default=5, ge=1)
+    telegram_destructive_actions_per_hour: int = Field(default=10, ge=1)
+    telegram_media_downloads_per_minute: int = Field(default=30, ge=1)
+    telegram_media_download_concurrency: int = Field(default=2, ge=1, le=4)
     telegram_auth_requests_per_hour: int = Field(default=3, ge=1)
     max_dialog_limit: int = Field(default=100, ge=1)
     max_message_limit: int = Field(default=100, ge=1)
     blocked_account_names: list[str] = Field(default_factory=lambda: ["string", "account"])
     telegram_min_action_interval_seconds: float = Field(default=1.25, ge=0)
+    telegram_default_flood_cooldown_seconds: int = Field(default=300, ge=1)
     queue_visibility_timeout_seconds: int = Field(default=300, ge=1)
     queue_default_max_attempts: int = Field(default=3, ge=1)
     keep_accounts_online: bool = True
@@ -461,6 +505,11 @@ class SendMessagePayload(BaseModel):
     entity: str | int
     text: str
     parse_mode: str | None = None
+
+
+class MessageListPayload(BaseModel):
+    entity: Any
+    limit: int = 50
 
 
 class SendUsernameMessagePayload(BaseModel):
@@ -660,6 +709,16 @@ def create_app(state: ApiState) -> FastAPI:
                 REQUEST_SCOPES.reset(scope_token)
                 return JSONResponse({"detail": str(exc)}, status_code=400)
 
+        action_lock: asyncio.Lock | None = None
+        if service.telegram_safe_mode and service.telegram_serialize_account_actions and should_serialize_http_path(request.url.path):
+            try:
+                action_lock = state.telegram_action_lock(account)
+                await action_lock.acquire()
+            except ValueError as exc:
+                await audit_request(state, request, 400, token)
+                REQUEST_SCOPES.reset(scope_token)
+                return JSONResponse({"detail": str(exc)}, status_code=400)
+
         try:
             response = await asyncio.wait_for(
                 call_next(request),
@@ -671,10 +730,15 @@ def create_app(state: ApiState) -> FastAPI:
             await audit_request(state, request, 504, token)
             return JSONResponse({"detail": "Request timeout"}, status_code=504)
         except FloodWaitError as exc:
+            flood_account = REQUEST_TELEGRAM_ACCOUNT.get() or account
+            flood_action = REQUEST_TELEGRAM_ACTION.get()
+            state.record_flood_wait(flood_account, flood_action, getattr(exc, "seconds", None))
             await audit_request(state, request, 429, token)
             return JSONResponse(
                 {
                     "detail": "Telegram flood wait",
+                    "account": state.resolve_account(flood_account),
+                    "action": flood_action or "unknown",
                     "seconds": getattr(exc, "seconds", None),
                     "retry_after": getattr(exc, "seconds", None),
                 },
@@ -704,11 +768,17 @@ def create_app(state: ApiState) -> FastAPI:
                 status_code=503,
             )
         finally:
+            if action_lock and action_lock.locked():
+                action_lock.release()
             REQUEST_SCOPES.reset(scope_token)
 
     @app.get("/health")
     async def health() -> dict[str, str]:
-        return {"status": "ok"}
+        return {
+            "status": "ok",
+            "server_os": "windows" if os.name == "nt" else "linux",
+            "path_style": "windows" if os.name == "nt" else "posix",
+        }
 
     @app.get("/capabilities")
     async def capabilities() -> dict[str, Any]:
@@ -722,8 +792,10 @@ def create_app(state: ApiState) -> FastAPI:
                         "POST /accounts/disconnect",
                         "GET /accounts/online",
                         "GET /accounts/health",
+                        "GET /accounts/risk-status",
                         "POST /accounts/entity-cache/warm",
                         "GET /accounts/entity-cache",
+                        "POST /messages/list",
                         "POST /messages/send",
                         "POST /messages/send-username",
                         "POST /messages/edit",
@@ -733,6 +805,7 @@ def create_app(state: ApiState) -> FastAPI:
                         "POST /messages/reaction",
                         "POST /media/send",
                         "POST /media/download",
+                        "POST /media/download/stream",
                         "POST /files/upload",
                         "POST /entities/resolve",
                         "POST /chats/join",
@@ -968,6 +1041,34 @@ def create_app(state: ApiState) -> FastAPI:
                 }
         return {"accounts": results}
 
+    @app.get("/accounts/risk-status")
+    async def account_risk_status(account: str | None = None) -> dict[str, Any]:
+        service = state.settings().service
+        accounts = [state.resolve_account(account)] if account else state.settings().accounts
+        now = int(time.time())
+        statuses: dict[str, Any] = {}
+        for account_name in accounts:
+            cooldown = state.telegram_cooldowns.get(account_name)
+            active_cooldown = None
+            if cooldown and int(cooldown.get("until_ts", 0)) > now:
+                active_cooldown = {
+                    **cooldown,
+                    "remaining_seconds": int(cooldown["until_ts"]) - now,
+                }
+            statuses[account_name] = {
+                "account": account_name,
+                "safe_mode": service.telegram_safe_mode,
+                "serialized_actions": service.telegram_serialize_account_actions,
+                "active_cooldown": active_cooldown,
+                "last_action_monotonic": state.last_telegram_action_at.get(account_name),
+                "online_status": state.online_status.get(account_name),
+                "connection_health": state.connection_health.get(account_name),
+            }
+        return {
+            "accounts": statuses,
+            "limits": telegram_limit_summary(service),
+        }
+
     @app.post("/accounts/entity-cache/warm")
     async def warm_account_entity_cache(
         account: str | None = None,
@@ -1067,8 +1168,26 @@ def create_app(state: ApiState) -> FastAPI:
     ) -> list[dict[str, Any]]:
         ensure_telegram_rate(state, account, "messages")
         limit = clamp_limit(limit, state.settings().service.max_message_limit)
-        layer = await state.require_layer(account)
-        return [serialize_message(message) async for message in layer.iter_messages(entity, limit=limit)]
+        client = await require_authorized_client(state, account)
+        decoded_entity = await decode_entity_argument(entity, client)
+        return [
+            serialize_message(message)
+            async for message in client.iter_messages(decoded_entity, limit=limit)
+        ]
+
+    @app.post("/messages/list")
+    async def list_messages(
+        payload: MessageListPayload,
+        account: str | None = None,
+    ) -> list[dict[str, Any]]:
+        ensure_telegram_rate(state, account, "messages")
+        limit = clamp_limit(payload.limit, state.settings().service.max_message_limit)
+        client = await require_authorized_client(state, account)
+        decoded_entity = await decode_entity_argument(payload.entity, client)
+        return [
+            serialize_message(message)
+            async for message in client.iter_messages(decoded_entity, limit=limit)
+        ]
 
     @app.post("/messages/send")
     async def send_message(
@@ -1199,7 +1318,8 @@ def create_app(state: ApiState) -> FastAPI:
         if not message:
             raise HTTPException(status_code=404, detail="Message not found")
         if payload.output_path:
-            output = await client.download_media(message, file=payload.output_path)
+            async with state.media_download_semaphore(account):
+                output = await client.download_media(message, file=payload.output_path)
             return {"path": str(output) if output else None}
         data = await client.download_media(message, file=bytes)
         if data is None:
@@ -1209,6 +1329,60 @@ def create_app(state: ApiState) -> FastAPI:
                 "data": {"_": "bytes", "base64": base64.b64encode(data).decode("ascii")}
             }
         return {"data": data.decode("utf-8", errors="replace")}
+
+    @app.post("/media/download/stream")
+    async def download_media_stream(
+        payload: DownloadMediaPayload,
+        account: str | None = None,
+    ) -> StreamingResponse:
+        """Download to a server-visible path and stream progress as NDJSON."""
+        if not payload.output_path:
+            raise HTTPException(status_code=400, detail="output_path is required for streamed download")
+
+        ensure_telegram_rate(state, account, "media.download")
+        client = await require_authorized_client(state, account)
+        message = await client.get_messages(payload.entity, ids=payload.message_id)
+        if not message:
+            raise HTTPException(status_code=404, detail="Message not found")
+
+        async def event_stream():
+            queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+            loop = asyncio.get_running_loop()
+
+            def on_progress(current: int, total: int) -> None:
+                loop.call_soon_threadsafe(
+                    queue.put_nowait,
+                    {"event": "progress", "received_bytes": current, "total_bytes": total},
+                )
+
+            yield json.dumps({"event": "queued", "message_id": payload.message_id}) + "\n"
+            async with state.media_download_semaphore(account):
+                task = asyncio.create_task(
+                    client.download_media(message, file=payload.output_path, progress_callback=on_progress)
+                )
+                yield json.dumps({"event": "start", "message_id": payload.message_id}) + "\n"
+                try:
+                    while not task.done():
+                        try:
+                            event = await asyncio.wait_for(queue.get(), timeout=0.5)
+                        except TimeoutError:
+                            yield json.dumps({"event": "heartbeat"}) + "\n"
+                        else:
+                            yield json.dumps(event) + "\n"
+
+                    output = await task
+                    while not queue.empty():
+                        yield json.dumps(queue.get_nowait()) + "\n"
+                    yield json.dumps({"event": "complete", "path": str(output) if output else None}) + "\n"
+                except asyncio.CancelledError:
+                    task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await task
+                    raise
+                except Exception as exc:
+                    yield json.dumps({"event": "error", "detail": str(exc)}) + "\n"
+
+        return StreamingResponse(event_stream(), media_type="application/x-ndjson")
 
     @app.post("/files/upload")
     async def upload_file(
@@ -1695,10 +1869,26 @@ def check_rate_limit(state: ApiState, key: str, limit_per_minute: int) -> bool:
 def ensure_telegram_rate(state: ApiState, account: str | None, action: str) -> None:
     service = state.settings().service
     account_name = state.resolve_account(account)
+    REQUEST_TELEGRAM_ACCOUNT.set(account_name)
+    REQUEST_TELEGRAM_ACTION.set(action)
+    cooldown = state.telegram_cooldowns.get(account_name)
+    now_ts = int(time.time())
+    if service.telegram_safe_mode and cooldown and int(cooldown.get("until_ts", 0)) > now_ts:
+        retry_after = int(cooldown["until_ts"]) - now_ts
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "message": "Telegram account cooldown is active after FloodWait.",
+                "account": account_name,
+                "action": cooldown.get("action"),
+                "retry_after": retry_after,
+            },
+            headers={"Retry-After": str(retry_after)},
+        )
     now = time.monotonic()
     previous = state.last_telegram_action_at.get(account_name)
     min_interval = service.telegram_min_action_interval_seconds
-    if previous is not None and min_interval > 0:
+    if action != "media.download" and previous is not None and min_interval > 0:
         wait_for = min_interval - (now - previous)
         if wait_for > 0:
             retry_after = max(1, int(wait_for + 0.999))
@@ -1711,26 +1901,31 @@ def ensure_telegram_rate(state: ApiState, account: str | None, action: str) -> N
                 headers={"Retry-After": str(retry_after)},
             )
     key = f"{account_name}:{action}"
+    action_limit, window_seconds = telegram_action_limit(service, action)
     if not check_bucket(
         state.telegram_rate_limits,
         key,
-        service.telegram_actions_per_minute,
-        window_seconds=60,
+        action_limit,
+        window_seconds=window_seconds,
     ):
+        retry_after = window_seconds
         raise HTTPException(
             status_code=429,
             detail=(
                 "Telegram action rate limit exceeded for this account/action. "
-                f"Limit: {service.telegram_actions_per_minute}/minute."
+                f"Limit: {action_limit}/{window_seconds}s."
             ),
-            headers={"Retry-After": "60"},
+            headers={"Retry-After": str(retry_after)},
         )
-    state.last_telegram_action_at[account_name] = now
+    if action != "media.download":
+        state.last_telegram_action_at[account_name] = now
 
 
 def ensure_telegram_auth_rate(state: ApiState, account: str | None) -> None:
     service = state.settings().service
     account_name = state.resolve_account(account)
+    REQUEST_TELEGRAM_ACCOUNT.set(account_name)
+    REQUEST_TELEGRAM_ACTION.set("auth")
     if not check_bucket(
         state.telegram_auth_rate_limits,
         account_name,
@@ -1745,6 +1940,66 @@ def ensure_telegram_auth_rate(state: ApiState, account: str | None) -> None:
             ),
             headers={"Retry-After": "3600"},
         )
+
+
+def telegram_action_limit(service: ServiceSettings, action: str) -> tuple[int, int]:
+    if action == "media.download":
+        return service.telegram_media_downloads_per_minute, 60
+    if action.startswith(("messages.send", "media.send", "bot.send")):
+        return service.telegram_send_actions_per_minute, 60
+    if action.startswith(("entities.resolve", "dialogs", "messages", "bot.getupdates")):
+        return service.telegram_resolve_actions_per_minute, 60
+    if action.startswith(("raw.", "layer.")):
+        return service.telegram_raw_actions_per_minute, 60
+    if action.startswith(("chats.join", "chats.leave")):
+        return service.telegram_join_actions_per_hour, 3600
+    if action.startswith(("admin.", "messages.delete", "messages.history.delete")):
+        return service.telegram_destructive_actions_per_hour, 3600
+    return service.telegram_actions_per_minute, 60
+
+
+def telegram_limit_summary(service: ServiceSettings) -> dict[str, Any]:
+    return {
+        "telegram_actions_per_minute": service.telegram_actions_per_minute,
+        "telegram_send_actions_per_minute": service.telegram_send_actions_per_minute,
+        "telegram_resolve_actions_per_minute": service.telegram_resolve_actions_per_minute,
+        "telegram_raw_actions_per_minute": service.telegram_raw_actions_per_minute,
+        "telegram_join_actions_per_hour": service.telegram_join_actions_per_hour,
+        "telegram_destructive_actions_per_hour": service.telegram_destructive_actions_per_hour,
+        "telegram_media_downloads_per_minute": service.telegram_media_downloads_per_minute,
+        "telegram_media_download_concurrency": service.telegram_media_download_concurrency,
+        "telegram_min_action_interval_seconds": service.telegram_min_action_interval_seconds,
+        "telegram_default_flood_cooldown_seconds": service.telegram_default_flood_cooldown_seconds,
+    }
+
+
+def should_serialize_http_path(path: str) -> bool:
+    if path in {"/health", "/config", "/capabilities", "/accounts", "/accounts/online", "/accounts/risk-status"}:
+        return False
+    if path.startswith(("/docs", "/redoc", "/openapi.json", "/events", "/ws/")):
+        return False
+    if path.startswith(("/media/download", "/queue/jobs")):
+        return False
+    return path.startswith(
+        (
+            "/auth/",
+            "/me",
+            "/dialogs",
+            "/messages",
+            "/media/",
+            "/files/",
+            "/entities/",
+            "/chats/",
+            "/stories/",
+            "/admin/",
+            "/raw/",
+            "/mtproto/",
+            "/bot",
+            "/rpc",
+            "/actions/execute",
+            "/tl/",
+        )
+    )
 
 
 def check_bucket(
@@ -1867,6 +2122,21 @@ def normalize_username_entity(value: str) -> str:
     if "/" in entity:
         return entity
     return f"@{entity}"
+
+
+async def decode_entity_argument(value: Any, client: Any) -> Any:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("{") or stripped.startswith("["):
+            try:
+                value = json.loads(stripped)
+            except json.JSONDecodeError as exc:
+                raise HTTPException(status_code=400, detail=f"Invalid entity JSON: {exc}") from exc
+        else:
+            return value
+    if isinstance(value, dict | list):
+        return await decode_tl_value(value, client=client)
+    return value
 
 
 def visible_accounts_response(settings: AppSettings, scopes: list[str] | None) -> dict[str, Any]:
@@ -2230,5 +2500,30 @@ def serialize_message(message: Message) -> dict[str, Any]:
         "text": message.message,
         "out": message.out,
         "mentioned": message.mentioned,
-        "media": type(message.media).__name__ if message.media else None,
+        "media": serialize_media_metadata(message.media),
     }
+
+
+def serialize_media_metadata(media: Any) -> dict[str, Any] | None:
+    """Keep enough Telegram media metadata for clients to select a real filename."""
+    if media is None:
+        return None
+    result: dict[str, Any] = {"type": type(media).__name__}
+    document = getattr(media, "document", None)
+    if document is not None:
+        result["mime_type"] = getattr(document, "mime_type", None)
+        result["size"] = getattr(document, "size", None)
+        for attribute in getattr(document, "attributes", []) or []:
+            file_name = getattr(attribute, "file_name", None)
+            if file_name:
+                result["file_name"] = file_name
+                break
+        return result
+
+    photo = getattr(media, "photo", None)
+    if photo is not None:
+        result["mime_type"] = "image/jpeg"
+        sizes = [getattr(size, "size", 0) or 0 for size in getattr(photo, "sizes", []) or []]
+        if sizes:
+            result["size"] = max(sizes)
+    return result

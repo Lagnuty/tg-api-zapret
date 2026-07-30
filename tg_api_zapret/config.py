@@ -104,12 +104,22 @@ class ServiceSettings:
     enable_raw_invoke: bool = False
     enable_layer_invoke: bool = False
     bot_token_accounts: dict[str, str] = field(default_factory=dict)
+    telegram_safe_mode: bool = True
+    telegram_serialize_account_actions: bool = True
     telegram_actions_per_minute: int = 20
+    telegram_send_actions_per_minute: int = 6
+    telegram_resolve_actions_per_minute: int = 10
+    telegram_raw_actions_per_minute: int = 3
+    telegram_join_actions_per_hour: int = 5
+    telegram_destructive_actions_per_hour: int = 10
+    telegram_media_downloads_per_minute: int = 30
+    telegram_media_download_concurrency: int = 2
     telegram_auth_requests_per_hour: int = 3
     max_dialog_limit: int = 100
     max_message_limit: int = 100
     blocked_account_names: list[str] = field(default_factory=lambda: ["string", "account"])
     telegram_min_action_interval_seconds: float = 1.25
+    telegram_default_flood_cooldown_seconds: int = 300
     queue_visibility_timeout_seconds: int = 300
     queue_default_max_attempts: int = 3
     keep_accounts_online: bool = True
@@ -153,8 +163,42 @@ class ServiceSettings:
                 str(token): normalize_account_name(account)
                 for token, account in dict(data.get("bot_token_accounts") or {}).items()
             },
+            telegram_safe_mode=bool(data.get("telegram_safe_mode", cls.telegram_safe_mode)),
+            telegram_serialize_account_actions=bool(
+                data.get("telegram_serialize_account_actions", cls.telegram_serialize_account_actions)
+            ),
             telegram_actions_per_minute=int(
                 data.get("telegram_actions_per_minute", cls.telegram_actions_per_minute)
+            ),
+            telegram_send_actions_per_minute=int(
+                data.get("telegram_send_actions_per_minute", cls.telegram_send_actions_per_minute)
+            ),
+            telegram_resolve_actions_per_minute=int(
+                data.get("telegram_resolve_actions_per_minute", cls.telegram_resolve_actions_per_minute)
+            ),
+            telegram_raw_actions_per_minute=int(
+                data.get("telegram_raw_actions_per_minute", cls.telegram_raw_actions_per_minute)
+            ),
+            telegram_join_actions_per_hour=int(
+                data.get("telegram_join_actions_per_hour", cls.telegram_join_actions_per_hour)
+            ),
+            telegram_destructive_actions_per_hour=int(
+                data.get(
+                    "telegram_destructive_actions_per_hour",
+                    cls.telegram_destructive_actions_per_hour,
+                )
+            ),
+            telegram_media_downloads_per_minute=int(
+                data.get(
+                    "telegram_media_downloads_per_minute",
+                    cls.telegram_media_downloads_per_minute,
+                )
+            ),
+            telegram_media_download_concurrency=int(
+                data.get(
+                    "telegram_media_download_concurrency",
+                    cls.telegram_media_download_concurrency,
+                )
             ),
             telegram_auth_requests_per_hour=int(
                 data.get("telegram_auth_requests_per_hour", cls.telegram_auth_requests_per_hour)
@@ -169,6 +213,12 @@ class ServiceSettings:
                 data.get(
                     "telegram_min_action_interval_seconds",
                     cls.telegram_min_action_interval_seconds,
+                )
+            ),
+            telegram_default_flood_cooldown_seconds=int(
+                data.get(
+                    "telegram_default_flood_cooldown_seconds",
+                    cls.telegram_default_flood_cooldown_seconds,
                 )
             ),
             queue_visibility_timeout_seconds=int(
@@ -231,12 +281,22 @@ class ServiceSettings:
             "enable_raw_invoke": self.enable_raw_invoke,
             "enable_layer_invoke": self.enable_layer_invoke,
             "bot_token_accounts": self.bot_token_accounts,
+            "telegram_safe_mode": self.telegram_safe_mode,
+            "telegram_serialize_account_actions": self.telegram_serialize_account_actions,
             "telegram_actions_per_minute": self.telegram_actions_per_minute,
+            "telegram_send_actions_per_minute": self.telegram_send_actions_per_minute,
+            "telegram_resolve_actions_per_minute": self.telegram_resolve_actions_per_minute,
+            "telegram_raw_actions_per_minute": self.telegram_raw_actions_per_minute,
+            "telegram_join_actions_per_hour": self.telegram_join_actions_per_hour,
+            "telegram_destructive_actions_per_hour": self.telegram_destructive_actions_per_hour,
+            "telegram_media_downloads_per_minute": self.telegram_media_downloads_per_minute,
+            "telegram_media_download_concurrency": self.telegram_media_download_concurrency,
             "telegram_auth_requests_per_hour": self.telegram_auth_requests_per_hour,
             "max_dialog_limit": self.max_dialog_limit,
             "max_message_limit": self.max_message_limit,
             "blocked_account_names": self.blocked_account_names,
             "telegram_min_action_interval_seconds": self.telegram_min_action_interval_seconds,
+            "telegram_default_flood_cooldown_seconds": self.telegram_default_flood_cooldown_seconds,
             "queue_visibility_timeout_seconds": self.queue_visibility_timeout_seconds,
             "queue_default_max_attempts": self.queue_default_max_attempts,
             "keep_accounts_online": self.keep_accounts_online,

@@ -165,7 +165,7 @@ HTTP API.
 python -m tg_api_zapret set-client-profile \
   --device-model "Telegram Desktop" \
   --system-version "Linux x86_64" \
-  --app-version 0.4.8
+  --app-version 0.4.16
 ```
 
 Для уже существующей сессии Telegram может оставить старое название. Надежный
@@ -528,6 +528,31 @@ curl -X PATCH http://127.0.0.1:8080/app/settings \
 ```
 
 Audit log пишет JSONL без body, кодов, паролей, session strings и proxy password.
+
+## Telegram Risk Controls
+
+These defaults do not guarantee that Telegram will not limit an account. They are guardrails
+that make API clients behave less like a bursty script:
+
+- `telegram_safe_mode=true`
+- `telegram_serialize_account_actions=true`
+- `telegram_min_action_interval_seconds=1.25`
+- `telegram_send_actions_per_minute=6`
+- `telegram_resolve_actions_per_minute=10`
+- `telegram_raw_actions_per_minute=3`
+- `telegram_join_actions_per_hour=5`
+- `telegram_destructive_actions_per_hour=10`
+- `telegram_default_flood_cooldown_seconds=300`
+
+Check active cooldowns and current limits:
+
+```bash
+curl http://127.0.0.1:8080/accounts/risk-status \
+  -H 'Authorization: Bearer admin-token'
+```
+
+If Telegram returns `FloodWait`, the API stores an account cooldown and returns `429` with
+`Retry-After` instead of continuing to hammer MTProto.
 
 ## WebSocket API
 
