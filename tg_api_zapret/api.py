@@ -83,6 +83,7 @@ class ApiState:
         )
         self.rate_limits: dict[str, list[float]] = {}
         self.telegram_rate_limits: dict[str, list[float]] = {}
+        self.telegram_account_rate_limits: dict[str, list[float]] = {}
         self.media_download_semaphores: dict[str, asyncio.Semaphore] = {}
         self.telegram_action_locks: dict[str, asyncio.Lock] = {}
         self.telegram_auth_rate_limits: dict[str, list[float]] = {}
@@ -252,7 +253,10 @@ class ApiState:
 
     async def _online_keepalive_loop(self, account: str) -> None:
         while True:
-            interval = max(15, self.settings().service.online_update_interval_seconds)
+            service = self.settings().service
+            min_interval = max(15, service.online_update_min_interval_seconds)
+            max_interval = max(min_interval, service.online_update_max_interval_seconds)
+            interval = random.uniform(min_interval, max_interval)
             try:
                 layer = await self.require_layer(account)
                 if await layer.is_authorized():
@@ -263,7 +267,7 @@ class ApiState:
                         "keep_online": True,
                         "connected": client.is_connected(),
                         "last_update_ts": int(time.time()),
-                        "interval_seconds": interval,
+                        "interval_seconds": round(interval, 2),
                     }
             except asyncio.CancelledError:
                 raise
@@ -273,7 +277,7 @@ class ApiState:
                     "keep_online": True,
                     "error": str(exc),
                     "last_update_ts": int(time.time()),
-                    "interval_seconds": interval,
+                    "interval_seconds": round(interval, 2),
                 }
             await asyncio.sleep(interval)
 
@@ -384,6 +388,7 @@ class ApiState:
         next_ping = 0.0
         next_state = 0.0
         next_difference = 0.0
+        next_dialogs = 0.0
         while True:
             service = self.settings().service
             try:
@@ -416,6 +421,13 @@ class ApiState:
                     )
                     self.apply_difference(account, difference)
                     next_difference = now + max(120, service.health_get_difference_interval_seconds)
+                if now >= next_dialogs:
+                    if service.entity_cache_warmup_dialogs > 0:
+                        await self.warm_entity_cache(
+                            account,
+                            limit=service.entity_cache_warmup_dialogs,
+                        )
+                    next_dialogs = now + max(60, service.health_dialog_refresh_interval_seconds)
                 self.connection_health.setdefault(account, {})
                 self.connection_health[account].update(
                     {
@@ -426,7 +438,7 @@ class ApiState:
                     }
                 )
                 self.set_account_state(account, "authorized")
-                next_deadline = min(next_ping, next_state, next_difference)
+                next_deadline = min(next_ping, next_state, next_difference, next_dialogs)
                 await asyncio.sleep(max(0.1, min(5.0, next_deadline - time.monotonic())))
             except asyncio.CancelledError:
                 raise
@@ -717,6 +729,27 @@ class ApiState:
                 (account, peer_key, max_id, safe_json_dumps(payload), int(time.time())),
             )
 
+    def persist_read_command(self, account: str, entity: Any, max_id: int, result: Any) -> None:
+        payload = {"entity": serialize_tl(entity), "result": serialize_tl(result)}
+        with self.open_state_db() as connection:
+            connection.execute(
+                """
+                insert into read_state(account, peer_key, max_id, payload_json, updated_ts)
+                values(?, ?, ?, ?, ?)
+                on conflict(account, peer_key) do update set
+                    max_id = max(read_state.max_id, excluded.max_id),
+                    payload_json = excluded.payload_json,
+                    updated_ts = excluded.updated_ts
+                """,
+                (
+                    account,
+                    str(serialize_tl(entity)),
+                    max_id,
+                    safe_json_dumps(payload),
+                    int(time.time()),
+                ),
+            )
+
     def load_entity_cache(self) -> None:
         path = self.state_db_path()
         if not path.exists():
@@ -877,6 +910,18 @@ class ApiState:
             )
             """
         )
+        connection.execute(
+            """
+            create table if not exists flood_errors(
+                id integer primary key autoincrement,
+                account text not null,
+                action text not null,
+                telegram_retry_after_seconds integer not null,
+                retry_after_seconds integer not null,
+                created_ts integer not null
+            )
+            """
+        )
 
     def set_account_state(self, account: str, state: str) -> None:
         account_name = self.resolve_account(account)
@@ -918,6 +963,35 @@ class ApiState:
             "until_ts": int(time.time() + retry_after),
             "recorded_ts": int(time.time()),
         }
+        self.persist_flood_wait(account_name, action or "unknown", base_retry_after, retry_after)
+
+    def persist_flood_wait(
+        self,
+        account: str,
+        action: str,
+        telegram_retry_after_seconds: int,
+        retry_after_seconds: int,
+    ) -> None:
+        with self.open_state_db() as connection:
+            connection.execute(
+                """
+                insert into flood_errors(
+                    account,
+                    action,
+                    telegram_retry_after_seconds,
+                    retry_after_seconds,
+                    created_ts
+                )
+                values(?, ?, ?, ?, ?)
+                """,
+                (
+                    account,
+                    action,
+                    telegram_retry_after_seconds,
+                    retry_after_seconds,
+                    int(time.time()),
+                ),
+            )
 
 
 class ProxyPayload(BaseModel):
@@ -972,6 +1046,9 @@ class ServiceSettingsPayload(BaseModel):
     telegram_media_downloads_per_minute: int = Field(default=30, ge=1)
     telegram_media_download_concurrency: int = Field(default=2, ge=1, le=4)
     telegram_auth_requests_per_hour: int = Field(default=3, ge=1)
+    telegram_requests_per_second: int = Field(default=30, ge=1)
+    telegram_requests_per_minute: int = Field(default=100, ge=1)
+    telegram_requests_per_hour: int = Field(default=1000, ge=1)
     max_dialog_limit: int = Field(default=100, ge=1)
     max_message_limit: int = Field(default=100, ge=1)
     blocked_account_names: list[str] = Field(default_factory=lambda: ["string", "account"])
@@ -981,16 +1058,19 @@ class ServiceSettingsPayload(BaseModel):
     queue_default_max_attempts: int = Field(default=3, ge=1)
     queue_execute_in_api: bool = True
     keep_accounts_online: bool = True
-    online_update_interval_seconds: int = Field(default=55, ge=15)
+    online_update_interval_seconds: int = Field(default=30, ge=15)
+    online_update_min_interval_seconds: int = Field(default=30, ge=15)
+    online_update_max_interval_seconds: int = Field(default=45, ge=15)
     auto_connect_accounts: list[str] = Field(default_factory=list)
     reconnect_enabled: bool = True
-    reconnect_min_delay_seconds: int = Field(default=5, ge=1)
-    reconnect_max_delay_seconds: int = Field(default=60, ge=1)
+    reconnect_min_delay_seconds: int = Field(default=1, ge=1)
+    reconnect_max_delay_seconds: int = Field(default=5, ge=1)
     passive_update_receiver: bool = True
     entity_cache_warmup_dialogs: int = Field(default=50, ge=0)
-    health_ping_interval_seconds: int = Field(default=60, ge=15)
-    health_get_state_interval_seconds: int = Field(default=300, ge=60)
-    health_get_difference_interval_seconds: int = Field(default=600, ge=120)
+    health_ping_interval_seconds: int = Field(default=30, ge=15)
+    health_get_state_interval_seconds: int = Field(default=75, ge=60)
+    health_get_difference_interval_seconds: int = Field(default=150, ge=120)
+    health_dialog_refresh_interval_seconds: int = Field(default=300, ge=60)
     require_connection_health_before_auth: bool = True
     connection_health_timeout_seconds: int = Field(default=20, ge=1)
 
@@ -1019,6 +1099,22 @@ class SendMessagePayload(BaseModel):
 class MessageListPayload(BaseModel):
     entity: Any
     limit: int = 50
+
+
+class TypingPayload(BaseModel):
+    entity: str | int
+
+
+class ReadMessagesPayload(BaseModel):
+    entity: str | int
+    max_id: int = Field(default=0, ge=0)
+
+
+class DraftPayload(BaseModel):
+    entity: str | int
+    text: str = ""
+    no_webpage: bool = False
+    reply_to_msg_id: int | None = None
 
 
 class SendUsernameMessagePayload(BaseModel):
@@ -1308,6 +1404,9 @@ def create_app(state: ApiState) -> FastAPI:
                         "GET /accounts/sync-state",
                         "POST /accounts/sync/difference",
                         "POST /messages/list",
+                        "POST /messages/typing",
+                        "POST /messages/read",
+                        "POST /drafts/save",
                         "POST /messages/send",
                         "POST /messages/send-username",
                         "POST /messages/edit",
@@ -1782,6 +1881,57 @@ def create_app(state: ApiState) -> FastAPI:
         if idempotency_key:
             state.idempotency_results[idempotency_key] = result
         return result
+
+    @app.post("/messages/typing")
+    async def set_typing(
+        payload: TypingPayload,
+        account: str | None = None,
+    ) -> dict[str, Any]:
+        ensure_telegram_rate(state, account, "messages.typing")
+        client = await require_authorized_client(state, account)
+        peer = await resolve_entity(payload.entity, client=client)
+        result = await client(
+            functions.messages.SetTypingRequest(
+                peer=peer,
+                action=types.SendMessageTypingAction(),
+            )
+        )
+        return {"result": serialize_tl(result)}
+
+    @app.post("/messages/read")
+    async def read_messages(
+        payload: ReadMessagesPayload,
+        account: str | None = None,
+    ) -> dict[str, Any]:
+        ensure_telegram_rate(state, account, "messages.read")
+        client = await require_authorized_client(state, account)
+        peer = await resolve_entity(payload.entity, client=client)
+        result = await client(
+            functions.messages.ReadHistoryRequest(
+                peer=peer,
+                max_id=payload.max_id,
+            )
+        )
+        state.persist_read_command(state.resolve_account(account), peer, payload.max_id, result)
+        return {"result": serialize_tl(result)}
+
+    @app.post("/drafts/save")
+    async def save_draft(
+        payload: DraftPayload,
+        account: str | None = None,
+    ) -> dict[str, Any]:
+        ensure_telegram_rate(state, account, "drafts.save")
+        client = await require_authorized_client(state, account)
+        peer = await resolve_entity(payload.entity, client=client)
+        result = await client(
+            functions.messages.SaveDraftRequest(
+                peer=peer,
+                message=payload.text,
+                no_webpage=payload.no_webpage,
+                reply_to_msg_id=payload.reply_to_msg_id,
+            )
+        )
+        return {"result": serialize_tl(result)}
 
     @app.post("/messages/send-username")
     async def send_username_message(
@@ -2477,6 +2627,7 @@ def ensure_telegram_rate(state: ApiState, account: str | None, action: str) -> N
             },
             headers={"Retry-After": str(retry_after)},
         )
+    ensure_account_telegram_budget(state, account_name)
     now = time.monotonic()
     previous = state.last_telegram_action_at.get(account_name)
     min_interval = service.telegram_min_action_interval_seconds
@@ -2513,6 +2664,31 @@ def ensure_telegram_rate(state: ApiState, account: str | None, action: str) -> N
         state.last_telegram_action_at[account_name] = now
 
 
+def ensure_account_telegram_budget(state: ApiState, account_name: str) -> None:
+    service = state.settings().service
+    checks = [
+        ("second", service.telegram_requests_per_second, 1),
+        ("minute", service.telegram_requests_per_minute, 60),
+        ("hour", service.telegram_requests_per_hour, 3600),
+    ]
+    for bucket_name, limit, window_seconds in checks:
+        if check_bucket(
+            state.telegram_account_rate_limits,
+            f"{account_name}:all:{bucket_name}",
+            limit,
+            window_seconds=window_seconds,
+        ):
+            continue
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                "Telegram account request budget exceeded. "
+                f"Limit: {limit}/{window_seconds}s."
+            ),
+            headers={"Retry-After": str(window_seconds)},
+        )
+
+
 def ensure_telegram_auth_rate(state: ApiState, account: str | None) -> None:
     service = state.settings().service
     account_name = state.resolve_account(account)
@@ -2539,7 +2715,7 @@ def telegram_action_limit(service: ServiceSettings, action: str) -> tuple[int, i
         return service.telegram_media_downloads_per_minute, 60
     if action.startswith(("messages.send", "media.send", "bot.send")):
         return service.telegram_send_actions_per_minute, 60
-    if action.startswith(("entities.resolve", "dialogs", "messages", "bot.getupdates")):
+    if action.startswith(("entities.resolve", "dialogs", "messages", "drafts.", "bot.getupdates")):
         return service.telegram_resolve_actions_per_minute, 60
     if action.startswith(("raw.", "layer.")):
         return service.telegram_raw_actions_per_minute, 60
@@ -2560,6 +2736,9 @@ def telegram_limit_summary(service: ServiceSettings) -> dict[str, Any]:
         "telegram_destructive_actions_per_hour": service.telegram_destructive_actions_per_hour,
         "telegram_media_downloads_per_minute": service.telegram_media_downloads_per_minute,
         "telegram_media_download_concurrency": service.telegram_media_download_concurrency,
+        "telegram_requests_per_second": service.telegram_requests_per_second,
+        "telegram_requests_per_minute": service.telegram_requests_per_minute,
+        "telegram_requests_per_hour": service.telegram_requests_per_hour,
         "telegram_min_action_interval_seconds": service.telegram_min_action_interval_seconds,
         "telegram_default_flood_cooldown_seconds": service.telegram_default_flood_cooldown_seconds,
     }

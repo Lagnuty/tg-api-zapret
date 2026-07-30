@@ -166,6 +166,9 @@ class ServiceSettings:
     telegram_media_downloads_per_minute: int = 30
     telegram_media_download_concurrency: int = 2
     telegram_auth_requests_per_hour: int = 3
+    telegram_requests_per_second: int = 30
+    telegram_requests_per_minute: int = 100
+    telegram_requests_per_hour: int = 1000
     max_dialog_limit: int = 100
     max_message_limit: int = 100
     blocked_account_names: list[str] = field(default_factory=lambda: ["string", "account"])
@@ -175,16 +178,19 @@ class ServiceSettings:
     queue_default_max_attempts: int = 3
     queue_execute_in_api: bool = True
     keep_accounts_online: bool = True
-    online_update_interval_seconds: int = 55
+    online_update_interval_seconds: int = 30
+    online_update_min_interval_seconds: int = 30
+    online_update_max_interval_seconds: int = 45
     auto_connect_accounts: list[str] = field(default_factory=list)
     reconnect_enabled: bool = True
-    reconnect_min_delay_seconds: int = 5
-    reconnect_max_delay_seconds: int = 60
+    reconnect_min_delay_seconds: int = 1
+    reconnect_max_delay_seconds: int = 5
     passive_update_receiver: bool = True
     entity_cache_warmup_dialogs: int = 50
-    health_ping_interval_seconds: int = 60
-    health_get_state_interval_seconds: int = 300
-    health_get_difference_interval_seconds: int = 600
+    health_ping_interval_seconds: int = 30
+    health_get_state_interval_seconds: int = 75
+    health_get_difference_interval_seconds: int = 150
+    health_dialog_refresh_interval_seconds: int = 300
     require_connection_health_before_auth: bool = True
     connection_health_timeout_seconds: int = 20
 
@@ -258,6 +264,15 @@ class ServiceSettings:
             telegram_auth_requests_per_hour=int(
                 data.get("telegram_auth_requests_per_hour", cls.telegram_auth_requests_per_hour)
             ),
+            telegram_requests_per_second=int(
+                data.get("telegram_requests_per_second", cls.telegram_requests_per_second)
+            ),
+            telegram_requests_per_minute=int(
+                data.get("telegram_requests_per_minute", cls.telegram_requests_per_minute)
+            ),
+            telegram_requests_per_hour=int(
+                data.get("telegram_requests_per_hour", cls.telegram_requests_per_hour)
+            ),
             max_dialog_limit=int(data.get("max_dialog_limit", cls.max_dialog_limit)),
             max_message_limit=int(data.get("max_message_limit", cls.max_message_limit)),
             blocked_account_names=[
@@ -286,6 +301,18 @@ class ServiceSettings:
             keep_accounts_online=bool(data.get("keep_accounts_online", cls.keep_accounts_online)),
             online_update_interval_seconds=int(
                 data.get("online_update_interval_seconds", cls.online_update_interval_seconds)
+            ),
+            online_update_min_interval_seconds=int(
+                data.get(
+                    "online_update_min_interval_seconds",
+                    cls.online_update_min_interval_seconds,
+                )
+            ),
+            online_update_max_interval_seconds=int(
+                data.get(
+                    "online_update_max_interval_seconds",
+                    cls.online_update_max_interval_seconds,
+                )
             ),
             auto_connect_accounts=[
                 normalize_account_name(item)
@@ -317,6 +344,12 @@ class ServiceSettings:
                 data.get(
                     "health_get_difference_interval_seconds",
                     cls.health_get_difference_interval_seconds,
+                )
+            ),
+            health_dialog_refresh_interval_seconds=int(
+                data.get(
+                    "health_dialog_refresh_interval_seconds",
+                    cls.health_dialog_refresh_interval_seconds,
                 )
             ),
             require_connection_health_before_auth=bool(
@@ -363,6 +396,9 @@ class ServiceSettings:
             "telegram_media_downloads_per_minute": self.telegram_media_downloads_per_minute,
             "telegram_media_download_concurrency": self.telegram_media_download_concurrency,
             "telegram_auth_requests_per_hour": self.telegram_auth_requests_per_hour,
+            "telegram_requests_per_second": self.telegram_requests_per_second,
+            "telegram_requests_per_minute": self.telegram_requests_per_minute,
+            "telegram_requests_per_hour": self.telegram_requests_per_hour,
             "max_dialog_limit": self.max_dialog_limit,
             "max_message_limit": self.max_message_limit,
             "blocked_account_names": self.blocked_account_names,
@@ -373,6 +409,8 @@ class ServiceSettings:
             "queue_execute_in_api": self.queue_execute_in_api,
             "keep_accounts_online": self.keep_accounts_online,
             "online_update_interval_seconds": self.online_update_interval_seconds,
+            "online_update_min_interval_seconds": self.online_update_min_interval_seconds,
+            "online_update_max_interval_seconds": self.online_update_max_interval_seconds,
             "auto_connect_accounts": self.auto_connect_accounts,
             "reconnect_enabled": self.reconnect_enabled,
             "reconnect_min_delay_seconds": self.reconnect_min_delay_seconds,
@@ -382,6 +420,7 @@ class ServiceSettings:
             "health_ping_interval_seconds": self.health_ping_interval_seconds,
             "health_get_state_interval_seconds": self.health_get_state_interval_seconds,
             "health_get_difference_interval_seconds": self.health_get_difference_interval_seconds,
+            "health_dialog_refresh_interval_seconds": self.health_dialog_refresh_interval_seconds,
             "require_connection_health_before_auth": self.require_connection_health_before_auth,
             "connection_health_timeout_seconds": self.connection_health_timeout_seconds,
         }

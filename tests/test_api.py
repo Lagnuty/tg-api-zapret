@@ -84,6 +84,9 @@ def test_capabilities_show_full_rpc_methods(tmp_path, monkeypatch) -> None:
     assert "GET /accounts/sync-state" in rest_endpoints
     assert "POST /accounts/sync/difference" in rest_endpoints
     assert "POST /messages/list" in rest_endpoints
+    assert "POST /messages/typing" in rest_endpoints
+    assert "POST /messages/read" in rest_endpoints
+    assert "POST /drafts/save" in rest_endpoints
 
 
 def test_dialog_serializer_includes_username_and_input_entity() -> None:

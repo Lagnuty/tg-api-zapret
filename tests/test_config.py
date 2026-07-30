@@ -139,14 +139,20 @@ def test_partial_service_settings_uses_safety_defaults(tmp_path) -> None:
     assert loaded.service.telegram_join_actions_per_hour == 5
     assert loaded.service.telegram_destructive_actions_per_hour == 10
     assert loaded.service.telegram_default_flood_cooldown_seconds == 300
+    assert loaded.service.telegram_requests_per_second == 30
+    assert loaded.service.telegram_requests_per_minute == 100
+    assert loaded.service.telegram_requests_per_hour == 1000
     assert loaded.service.queue_execute_in_api is True
     assert loaded.service.keep_accounts_online is True
-    assert loaded.service.online_update_interval_seconds == 55
+    assert loaded.service.online_update_interval_seconds == 30
+    assert loaded.service.online_update_min_interval_seconds == 30
+    assert loaded.service.online_update_max_interval_seconds == 45
     assert loaded.service.auto_connect_accounts == []
     assert loaded.service.reconnect_enabled is True
     assert loaded.service.passive_update_receiver is True
     assert loaded.service.entity_cache_warmup_dialogs == 50
-    assert loaded.service.health_ping_interval_seconds == 60
-    assert loaded.service.health_get_state_interval_seconds == 300
-    assert loaded.service.health_get_difference_interval_seconds == 600
+    assert loaded.service.health_ping_interval_seconds == 30
+    assert loaded.service.health_get_state_interval_seconds == 75
+    assert loaded.service.health_get_difference_interval_seconds == 150
+    assert loaded.service.health_dialog_refresh_interval_seconds == 300
     assert loaded.service.require_connection_health_before_auth is True
