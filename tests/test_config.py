@@ -1,11 +1,14 @@
 import pytest
 
-from tg_api_zapret import __version__
 from tg_api_zapret.config import (
     OFFICIAL_DESKTOP_API_HASH,
     OFFICIAL_DESKTOP_API_ID,
+    OFFICIAL_DESKTOP_APP_VERSION,
     AppSettings,
     TelegramConfig,
+    detect_lang_code,
+    detect_system_lang_code,
+    normalize_locale_code,
     parse_proxy_url,
 )
 
@@ -16,8 +19,10 @@ def test_config_uses_official_desktop_defaults() -> None:
     assert config.api_id == OFFICIAL_DESKTOP_API_ID
     assert config.api_hash == OFFICIAL_DESKTOP_API_HASH
     assert config.device_model == "Telegram Desktop"
-    assert config.system_version == "Linux x86_64"
-    assert config.app_version == __version__
+    assert config.system_version
+    assert config.app_version == OFFICIAL_DESKTOP_APP_VERSION
+    assert config.lang_code == detect_lang_code()
+    assert config.system_lang_code == detect_system_lang_code()
 
 
 def test_config_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -30,6 +35,12 @@ def test_config_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
     assert config.api_id == 123
     assert config.api_hash == "hash"
     assert config.timeout == 7
+
+
+def test_normalize_locale_code_handles_windows_language_names() -> None:
+    assert normalize_locale_code("Russian_Russia") == "ru-RU"
+    assert normalize_locale_code("Ukrainian_Ukraine") == "uk-UA"
+    assert normalize_locale_code("en_US") == "en-US"
 
 
 @pytest.mark.parametrize(
@@ -96,7 +107,7 @@ def test_legacy_client_profile_app_version_migrates_to_package_version(tmp_path)
 
     loaded = AppSettings.load(path)
 
-    assert loaded.client_profile.app_version == __version__
+    assert loaded.client_profile.app_version == OFFICIAL_DESKTOP_APP_VERSION
 
 
 def test_app_settings_accounts_roundtrip(tmp_path) -> None:
@@ -132,4 +143,7 @@ def test_partial_service_settings_uses_safety_defaults(tmp_path) -> None:
     assert loaded.service.reconnect_enabled is True
     assert loaded.service.passive_update_receiver is True
     assert loaded.service.entity_cache_warmup_dialogs == 50
+    assert loaded.service.health_ping_interval_seconds == 60
+    assert loaded.service.health_get_state_interval_seconds == 300
+    assert loaded.service.health_get_difference_interval_seconds == 600
     assert loaded.service.require_connection_health_before_auth is True

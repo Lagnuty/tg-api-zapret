@@ -16,7 +16,11 @@ from tg_api_zapret.client import TelegramLayer
 from tg_api_zapret.config import (
     AppSettings,
     ClientProfile,
+    OFFICIAL_DESKTOP_APP_VERSION,
     TelegramConfig,
+    detect_lang_code,
+    detect_system_lang_code,
+    detect_system_version,
     normalize_account_name,
     validate_proxy_url,
 )
@@ -139,10 +143,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     profile = subparsers.add_parser("set-client-profile", help="Set Telegram device name/profile.")
     profile.add_argument("--device-model", default="Telegram Desktop")
-    profile.add_argument("--system-version", default="Linux x86_64")
-    profile.add_argument("--app-version", default=__version__)
-    profile.add_argument("--lang-code", default="en")
-    profile.add_argument("--system-lang-code", default="en-US")
+    profile.add_argument("--system-version", default=detect_system_version())
+    profile.add_argument("--app-version", default=OFFICIAL_DESKTOP_APP_VERSION)
+    profile.add_argument("--lang-code", default=detect_lang_code())
+    profile.add_argument("--system-lang-code", default=detect_system_lang_code())
 
     subparsers.add_parser("clear-proxy", help="Remove saved proxy settings.")
     subparsers.add_parser("show-config", help="Print current app settings.")

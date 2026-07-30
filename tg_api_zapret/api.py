@@ -9,6 +9,8 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import random
+import sqlite3
 import tempfile
 import time
 from typing import Any
@@ -30,8 +32,12 @@ from tg_api_zapret.client import SentCode, TelegramLayer
 from tg_api_zapret.config import (
     AppSettings,
     ClientProfile,
+    OFFICIAL_DESKTOP_APP_VERSION,
     ServiceSettings,
     TelegramConfig,
+    detect_lang_code,
+    detect_system_lang_code,
+    detect_system_version,
     normalize_account_name,
     validate_proxy_url,
 )
@@ -80,6 +86,7 @@ class ApiState:
         self.telegram_action_locks: dict[str, asyncio.Lock] = {}
         self.telegram_auth_rate_limits: dict[str, list[float]] = {}
         self.telegram_cooldowns: dict[str, dict[str, Any]] = {}
+        self.idempotency_results: dict[str, dict[str, Any]] = {}
         self.last_telegram_action_at: dict[str, float] = {}
         self.bot_updates: dict[str, list[dict[str, Any]]] = {}
         self.bot_update_ids: dict[str, int] = {}
@@ -87,14 +94,17 @@ class ApiState:
         self.online_tasks: dict[str, asyncio.Task[None]] = {}
         self.online_status: dict[str, dict[str, Any]] = {}
         self.reconnect_tasks: dict[str, asyncio.Task[None]] = {}
+        self.health_tasks: dict[str, asyncio.Task[None]] = {}
         self.queue_worker_task: asyncio.Task[None] | None = None
         self.queue_worker_status: dict[str, Any] = {}
         self.update_handlers: dict[str, tuple[Any, Any]] = {}
         self.entity_cache: dict[str, dict[str, dict[str, Any]]] = {}
         self.connection_health: dict[str, dict[str, Any]] = {}
+        self.account_states: dict[str, dict[str, Any]] = {}
 
     async def startup(self) -> None:
         service = self.settings().service
+        self.load_entity_cache()
         if service.queue_execute_in_api and not self.queue.runs_inline:
             self.start_queue_worker()
         for account in service.auto_connect_accounts:
@@ -120,6 +130,7 @@ class ApiState:
     async def connect(self, account: str | None = None) -> TelegramLayer:
         account_name = self.resolve_account(account)
         settings = self.settings()
+        self.set_account_state(account_name, "connecting")
         if self.session_db:
             backend = SQLiteSessionBackend(self.session_db, account_name)
         else:
@@ -135,12 +146,21 @@ class ApiState:
             ),
             backend,
         )
-        await layer.connect()
+        try:
+            await layer.connect()
+        except Exception:
+            self.set_account_state(account_name, "disconnected")
+            raise
         self.layers[account_name] = layer
         if account_name not in settings.accounts:
             self.save_settings(settings.with_account(account_name))
         if settings.service.keep_accounts_online and await layer.is_authorized():
+            self.set_account_state(account_name, "authorized")
             await self.activate_desktop_like_runtime(account_name)
+        elif await layer.is_authorized():
+            self.set_account_state(account_name, "authorized")
+        else:
+            self.set_account_state(account_name, "disconnected")
         return layer
 
     async def disconnect(self, account: str | None = None) -> None:
@@ -149,6 +169,8 @@ class ApiState:
                 await self.stop_online_keepalive(account_name)
             for account_name in list(self.reconnect_tasks):
                 await self.stop_reconnect_loop(account_name)
+            for account_name in list(self.health_tasks):
+                await self.stop_desktop_sync_loop(account_name)
             await self.stop_queue_worker()
             for account_name in list(self.update_handlers):
                 await self.stop_passive_update_receiver(account_name)
@@ -160,10 +182,12 @@ class ApiState:
         account_name = self.resolve_account(account)
         await self.stop_online_keepalive(account_name)
         await self.stop_reconnect_loop(account_name)
+        await self.stop_desktop_sync_loop(account_name)
         await self.stop_passive_update_receiver(account_name)
         layer = self.layers.pop(account_name, None)
         if layer:
             await layer.disconnect()
+        self.set_account_state(account_name, "disconnected")
 
     async def require_layer(self, account: str | None = None) -> TelegramLayer:
         account_name = self.resolve_account(account)
@@ -200,6 +224,7 @@ class ApiState:
             await self.warm_entity_cache(account_name, limit=service.entity_cache_warmup_dialogs)
         if service.reconnect_enabled:
             self.start_reconnect_loop(account_name)
+        self.start_desktop_sync_loop(account_name)
 
     async def stop_online_keepalive(self, account: str) -> None:
         account_name = self.resolve_account(account)
@@ -257,6 +282,23 @@ class ApiState:
             return
         self.reconnect_tasks[account_name] = asyncio.create_task(self._reconnect_loop(account_name))
 
+    def start_desktop_sync_loop(self, account: str) -> None:
+        account_name = self.resolve_account(account)
+        task = self.health_tasks.get(account_name)
+        if task and not task.done():
+            return
+        self.health_tasks[account_name] = asyncio.create_task(self._desktop_sync_loop(account_name))
+
+    async def stop_desktop_sync_loop(self, account: str) -> None:
+        account_name = self.resolve_account(account)
+        task = self.health_tasks.pop(account_name, None)
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+
     def start_queue_worker(self) -> None:
         task = self.queue_worker_task
         if task and not task.done():
@@ -300,8 +342,11 @@ class ApiState:
                 layer = await self.require_layer(account)
                 client = await layer.authorized_client()
                 if not client.is_connected():
+                    self.set_account_state(account, "connecting")
                     await layer.connect()
-                if await layer.is_authorized():
+                authorized = await layer.is_authorized()
+                if authorized:
+                    self.set_account_state(account, "authorized")
                     if service.keep_accounts_online:
                         self.start_online_keepalive(account)
                     if service.passive_update_receiver and account not in self.update_handlers:
@@ -312,6 +357,10 @@ class ApiState:
                         "connected": client.is_connected(),
                         "last_check_ts": int(time.time()),
                     }
+                    if service.entity_cache_warmup_dialogs > 0:
+                        await self.warm_entity_cache(account, limit=service.entity_cache_warmup_dialogs)
+                else:
+                    self.set_account_state(account, "revoked")
                 delay = min_delay
             except asyncio.CancelledError:
                 raise
@@ -323,10 +372,69 @@ class ApiState:
                     "last_check_ts": int(time.time()),
                     "next_retry_seconds": delay,
                 }
+                self.set_account_state(account, "disconnected")
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, max_delay)
                 continue
             await asyncio.sleep(max(min_delay, delay))
+
+    async def _desktop_sync_loop(self, account: str) -> None:
+        next_ping = 0.0
+        next_state = 0.0
+        next_difference = 0.0
+        last_state: Any = None
+        while True:
+            service = self.settings().service
+            try:
+                layer = await self.require_layer(account)
+                if not await layer.is_authorized():
+                    self.set_account_state(account, "revoked")
+                    await asyncio.sleep(service.health_ping_interval_seconds)
+                    continue
+                client = await layer.authorized_client()
+                now = time.monotonic()
+                self.set_account_state(account, "updating")
+                if now >= next_ping:
+                    await client(functions.PingRequest(ping_id=random.getrandbits(63)))
+                    next_ping = now + max(15, service.health_ping_interval_seconds)
+                if now >= next_state:
+                    last_state = await client(functions.updates.GetStateRequest())
+                    next_state = now + max(60, service.health_get_state_interval_seconds)
+                if now >= next_difference and last_state is not None:
+                    await client(
+                        functions.updates.GetDifferenceRequest(
+                            pts=getattr(last_state, "pts", 0),
+                            date=getattr(last_state, "date", 0),
+                            qts=getattr(last_state, "qts", 0),
+                        )
+                    )
+                    next_difference = now + max(120, service.health_get_difference_interval_seconds)
+                self.connection_health.setdefault(account, {})
+                self.connection_health[account].update(
+                    {
+                        "account": account,
+                        "ok": True,
+                        "desktop_sync": True,
+                        "last_sync_ts": int(time.time()),
+                    }
+                )
+                self.set_account_state(account, "authorized")
+                await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self.connection_health.setdefault(account, {})
+                self.connection_health[account].update(
+                    {
+                        "account": account,
+                        "ok": False,
+                        "desktop_sync": True,
+                        "error": str(exc),
+                        "last_sync_error_ts": int(time.time()),
+                    }
+                )
+                self.set_account_state(account, "disconnected")
+                await asyncio.sleep(random.uniform(5, 15))
 
     async def start_passive_update_receiver(self, account: str) -> None:
         account_name = self.resolve_account(account)
@@ -378,6 +486,7 @@ class ApiState:
                 cache[f"@{username}".lower()] = serialized
                 cache[str(username).lower()] = serialized
         self.entity_cache[account_name] = cache
+        self.save_entity_cache()
         return {
             "account": account_name,
             "cached": len(cache),
@@ -415,6 +524,66 @@ class ApiState:
             )
         return result
 
+    def load_entity_cache(self) -> None:
+        path = self.state_db_path()
+        if not path.exists():
+            return
+        try:
+            with sqlite3.connect(path) as connection:
+                self.ensure_state_schema(connection)
+                rows = connection.execute("select account, cache_json from entity_cache").fetchall()
+        except sqlite3.Error:
+            return
+        cache: dict[str, dict[str, dict[str, Any]]] = {}
+        for account, cache_json in rows:
+            try:
+                entities = json.loads(cache_json)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(entities, dict):
+                cache[normalize_account_name(account)] = entities
+        self.entity_cache = cache
+
+    def save_entity_cache(self) -> None:
+        path = self.state_db_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(path) as connection:
+            self.ensure_state_schema(connection)
+            for account, entities in self.entity_cache.items():
+                connection.execute(
+                    """
+                    insert into entity_cache(account, cache_json, updated_ts)
+                    values(?, ?, ?)
+                    on conflict(account) do update set
+                        cache_json = excluded.cache_json,
+                        updated_ts = excluded.updated_ts
+                    """,
+                    (account, json.dumps(entities, ensure_ascii=False), int(time.time())),
+                )
+
+    def state_db_path(self) -> Path:
+        return self.config_file.with_suffix(".state.sqlite3")
+
+    @staticmethod
+    def ensure_state_schema(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            create table if not exists entity_cache(
+                account text primary key,
+                cache_json text not null,
+                updated_ts integer not null
+            )
+            """
+        )
+
+    def set_account_state(self, account: str, state: str) -> None:
+        account_name = self.resolve_account(account)
+        self.account_states[account_name] = {
+            "account": account_name,
+            "state": state,
+            "updated_ts": int(time.time()),
+        }
+
     def media_download_semaphore(self, account: str | None = None) -> asyncio.Semaphore:
         account_name = self.resolve_account(account)
         limit = self.settings().service.telegram_media_download_concurrency
@@ -434,10 +603,15 @@ class ApiState:
 
     def record_flood_wait(self, account: str | None, action: str | None, seconds: int | None) -> None:
         account_name = self.resolve_account(account)
-        retry_after = max(1, int(seconds or self.settings().service.telegram_default_flood_cooldown_seconds))
+        base_retry_after = max(
+            1,
+            int(seconds or self.settings().service.telegram_default_flood_cooldown_seconds),
+        )
+        retry_after = max(1, int(base_retry_after * random.uniform(1.0, 1.05)))
         self.telegram_cooldowns[account_name] = {
             "account": account_name,
             "action": action or "unknown",
+            "telegram_retry_after_seconds": base_retry_after,
             "retry_after_seconds": retry_after,
             "until_ts": int(time.time() + retry_after),
             "recorded_ts": int(time.time()),
@@ -459,10 +633,10 @@ class AccountConnectPayload(BaseModel):
 
 class ClientProfilePayload(BaseModel):
     device_model: str = Field(default="Telegram Desktop", min_length=1)
-    system_version: str = Field(default="Linux x86_64", min_length=1)
-    app_version: str = Field(default=__version__, min_length=1)
-    lang_code: str = Field(default="en", min_length=1)
-    system_lang_code: str = Field(default="en-US", min_length=1)
+    system_version: str = Field(default_factory=detect_system_version, min_length=1)
+    app_version: str = Field(default=OFFICIAL_DESKTOP_APP_VERSION, min_length=1)
+    lang_code: str = Field(default_factory=detect_lang_code, min_length=1)
+    system_lang_code: str = Field(default_factory=detect_system_lang_code, min_length=1)
 
 
 class ServiceSettingsPayload(BaseModel):
@@ -512,6 +686,9 @@ class ServiceSettingsPayload(BaseModel):
     reconnect_max_delay_seconds: int = Field(default=60, ge=1)
     passive_update_receiver: bool = True
     entity_cache_warmup_dialogs: int = Field(default=50, ge=0)
+    health_ping_interval_seconds: int = Field(default=60, ge=15)
+    health_get_state_interval_seconds: int = Field(default=300, ge=60)
+    health_get_difference_interval_seconds: int = Field(default=600, ge=120)
     require_connection_health_before_auth: bool = True
     connection_health_timeout_seconds: int = Field(default=20, ge=1)
 
@@ -534,6 +711,7 @@ class SendMessagePayload(BaseModel):
     entity: str | int
     text: str
     parse_mode: str | None = None
+    idempotency_key: str | None = None
 
 
 class MessageListPayload(BaseModel):
@@ -545,6 +723,7 @@ class SendUsernameMessagePayload(BaseModel):
     username: str = Field(description="Telegram username with or without @, phone, or t.me link.")
     text: str
     parse_mode: str | None = None
+    idempotency_key: str | None = None
 
 
 class EditMessagePayload(BaseModel):
@@ -1045,6 +1224,7 @@ def create_app(state: ApiState) -> FastAPI:
             "keep_accounts_online": state.settings().service.keep_accounts_online,
             "accounts": state.online_status,
             "connection_health": state.connection_health,
+            "account_states": state.account_states,
             "running_tasks": sorted(
                 account for account, task in state.online_tasks.items() if not task.done()
             ),
@@ -1052,6 +1232,9 @@ def create_app(state: ApiState) -> FastAPI:
                 account for account, task in state.reconnect_tasks.items() if not task.done()
             ),
             "passive_receivers": sorted(state.update_handlers),
+            "desktop_sync_tasks": sorted(
+                account for account, task in state.health_tasks.items() if not task.done()
+            ),
             "queue_worker": state.queue_worker_status,
         }
 
@@ -1104,6 +1287,7 @@ def create_app(state: ApiState) -> FastAPI:
                 "last_action_monotonic": state.last_telegram_action_at.get(account_name),
                 "online_status": state.online_status.get(account_name),
                 "connection_health": state.connection_health.get(account_name),
+                "account_state": state.account_states.get(account_name),
             }
         return {
             "accounts": statuses,
@@ -1236,13 +1420,25 @@ def create_app(state: ApiState) -> FastAPI:
         account: str | None = None,
     ) -> dict[str, Any]:
         ensure_telegram_rate(state, account, "messages.send")
-        layer = await state.require_layer(account)
-        message = await layer.send_message(
-            payload.entity,
-            payload.text,
-            parse_mode=payload.parse_mode,
+        idempotency_key = make_action_idempotency_key(
+            state.resolve_account(account),
+            "messages.send",
+            payload.idempotency_key,
         )
-        return serialize_message(message)
+        if idempotency_key and idempotency_key in state.idempotency_results:
+            return state.idempotency_results[idempotency_key]
+        layer = await state.require_layer(account)
+        message = await retry_telegram_call(
+            lambda: layer.send_message(
+                payload.entity,
+                payload.text,
+                parse_mode=payload.parse_mode,
+            )
+        )
+        result = serialize_message(message)
+        if idempotency_key:
+            state.idempotency_results[idempotency_key] = result
+        return result
 
     @app.post("/messages/send-username")
     async def send_username_message(
@@ -1250,13 +1446,25 @@ def create_app(state: ApiState) -> FastAPI:
         account: str | None = None,
     ) -> dict[str, Any]:
         ensure_telegram_rate(state, account, "messages.send")
-        layer = await state.require_layer(account)
-        message = await layer.send_message(
-            normalize_username_entity(payload.username),
-            payload.text,
-            parse_mode=payload.parse_mode,
+        idempotency_key = make_action_idempotency_key(
+            state.resolve_account(account),
+            "messages.send_username",
+            payload.idempotency_key,
         )
-        return serialize_message(message)
+        if idempotency_key and idempotency_key in state.idempotency_results:
+            return state.idempotency_results[idempotency_key]
+        layer = await state.require_layer(account)
+        message = await retry_telegram_call(
+            lambda: layer.send_message(
+                normalize_username_entity(payload.username),
+                payload.text,
+                parse_mode=payload.parse_mode,
+            )
+        )
+        result = serialize_message(message)
+        if idempotency_key:
+            state.idempotency_results[idempotency_key] = result
+        return result
 
     @app.post("/messages/edit")
     async def edit_message(
@@ -2041,6 +2249,27 @@ def should_serialize_http_path(path: str) -> bool:
             "/tl/",
         )
     )
+
+
+async def retry_telegram_call(call_factory: Any, *, max_attempts: int = 5) -> Any:
+    delay = 1.0
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return await call_factory()
+        except FloodWaitError:
+            raise
+        except (ConnectionError, TimeoutError, OSError, RPCError):
+            if attempt >= max_attempts:
+                raise
+            await asyncio.sleep(delay + random.uniform(0, delay * 0.2))
+            delay = min(delay * 2, 16)
+    raise RuntimeError("unreachable retry state")
+
+
+def make_action_idempotency_key(account: str, action: str, value: str | None) -> str | None:
+    if not value:
+        return None
+    return f"{account}:{action}:{value}"
 
 
 def check_bucket(

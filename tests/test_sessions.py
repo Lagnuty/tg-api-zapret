@@ -2,6 +2,7 @@ from tg_api_zapret.sessions import (
     FileSessionBackend,
     SQLiteSessionBackend,
     StaticStringSessionBackend,
+    SessionFileLock,
     TelethonSessionFileBackend,
     decode_session_from_transport,
     encode_session_for_transport,
@@ -45,3 +46,20 @@ def test_transport_encoding_roundtrip() -> None:
     encoded = encode_session_for_transport("session-value")
 
     assert decode_session_from_transport(encoded) == "session-value"
+
+
+def test_session_file_lock_blocks_second_owner(tmp_path) -> None:
+    path = tmp_path / "main.session.lock"
+    first = SessionFileLock(path)
+    second = SessionFileLock(path)
+
+    first.acquire()
+    try:
+        try:
+            second.acquire()
+        except RuntimeError as exc:
+            assert "already locked" in str(exc)
+        else:
+            raise AssertionError("second lock unexpectedly acquired")
+    finally:
+        first.release()

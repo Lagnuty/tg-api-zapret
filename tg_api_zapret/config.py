@@ -2,15 +2,62 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 import json
+import locale
 import os
 from pathlib import Path
+import platform
 from typing import Any
 from urllib.parse import urlparse
 
-from tg_api_zapret.version import __version__
-
 OFFICIAL_DESKTOP_API_ID = 2040
 OFFICIAL_DESKTOP_API_HASH = "b18441a1ff607e10a989891a5462e627"
+OFFICIAL_DESKTOP_APP_VERSION = "7.0.4"
+LANGUAGE_ALIASES = {
+    "english": "en",
+    "russian": "ru",
+    "ukrainian": "uk",
+}
+COUNTRY_ALIASES = {
+    "russia": "RU",
+    "ukraine": "UA",
+    "united states": "US",
+}
+
+
+def detect_system_version() -> str:
+    system = platform.system() or "Linux"
+    release = platform.release()
+    machine = platform.machine()
+    parts = [system]
+    if release:
+        parts.append(release)
+    if machine:
+        parts.append(machine)
+    return " ".join(parts)
+
+
+def detect_system_lang_code() -> str:
+    language, _ = locale.getlocale()
+    if not language:
+        language = os.getenv("LANG", "").split(".", 1)[0]
+    return normalize_locale_code(language or "en-US")
+
+
+def detect_lang_code() -> str:
+    return detect_system_lang_code().split("-", 1)[0].lower() or "en"
+
+
+def normalize_locale_code(value: str) -> str:
+    normalized = value.replace("_", "-").strip()
+    if not normalized:
+        return "en-US"
+    parts = normalized.split("-", 1)
+    language = LANGUAGE_ALIASES.get(parts[0].lower(), parts[0].lower())
+    if len(parts) == 1:
+        return language
+    country_raw = parts[1].replace("-", " ").strip()
+    country = COUNTRY_ALIASES.get(country_raw.lower(), country_raw.upper())
+    return f"{language}-{country}"
 
 
 @dataclass(frozen=True)
@@ -18,10 +65,10 @@ class TelegramConfig:
     api_id: int = OFFICIAL_DESKTOP_API_ID
     api_hash: str = OFFICIAL_DESKTOP_API_HASH
     device_model: str = "Telegram Desktop"
-    system_version: str = "Linux x86_64"
-    app_version: str = __version__
-    lang_code: str = "en"
-    system_lang_code: str = "en-US"
+    system_version: str = field(default_factory=detect_system_version)
+    app_version: str = OFFICIAL_DESKTOP_APP_VERSION
+    lang_code: str = field(default_factory=detect_lang_code)
+    system_lang_code: str = field(default_factory=detect_system_lang_code)
     request_retries: int = 5
     connection_retries: int = 5
     retry_delay: int = 2
@@ -56,21 +103,22 @@ class TelegramConfig:
 @dataclass(frozen=True)
 class ClientProfile:
     device_model: str = "Telegram Desktop"
-    system_version: str = "Linux x86_64"
-    app_version: str = __version__
-    lang_code: str = "en"
-    system_lang_code: str = "en-US"
+    system_version: str = field(default_factory=detect_system_version)
+    app_version: str = OFFICIAL_DESKTOP_APP_VERSION
+    lang_code: str = field(default_factory=detect_lang_code)
+    system_lang_code: str = field(default_factory=detect_system_lang_code)
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "ClientProfile":
+        defaults = cls()
         if not data:
-            return cls()
+            return defaults
         return cls(
-            device_model=data.get("device_model") or cls.device_model,
-            system_version=data.get("system_version") or cls.system_version,
+            device_model=data.get("device_model") or defaults.device_model,
+            system_version=data.get("system_version") or defaults.system_version,
             app_version=normalize_app_version(data.get("app_version")),
-            lang_code=data.get("lang_code") or cls.lang_code,
-            system_lang_code=data.get("system_lang_code") or cls.system_lang_code,
+            lang_code=data.get("lang_code") or defaults.lang_code,
+            system_lang_code=data.get("system_lang_code") or defaults.system_lang_code,
         )
 
     def to_dict(self) -> dict[str, str]:
@@ -131,6 +179,9 @@ class ServiceSettings:
     reconnect_max_delay_seconds: int = 60
     passive_update_receiver: bool = True
     entity_cache_warmup_dialogs: int = 50
+    health_ping_interval_seconds: int = 60
+    health_get_state_interval_seconds: int = 300
+    health_get_difference_interval_seconds: int = 600
     require_connection_health_before_auth: bool = True
     connection_health_timeout_seconds: int = 20
 
@@ -250,6 +301,21 @@ class ServiceSettings:
             entity_cache_warmup_dialogs=int(
                 data.get("entity_cache_warmup_dialogs", cls.entity_cache_warmup_dialogs)
             ),
+            health_ping_interval_seconds=int(
+                data.get("health_ping_interval_seconds", cls.health_ping_interval_seconds)
+            ),
+            health_get_state_interval_seconds=int(
+                data.get(
+                    "health_get_state_interval_seconds",
+                    cls.health_get_state_interval_seconds,
+                )
+            ),
+            health_get_difference_interval_seconds=int(
+                data.get(
+                    "health_get_difference_interval_seconds",
+                    cls.health_get_difference_interval_seconds,
+                )
+            ),
             require_connection_health_before_auth=bool(
                 data.get(
                     "require_connection_health_before_auth",
@@ -310,6 +376,9 @@ class ServiceSettings:
             "reconnect_max_delay_seconds": self.reconnect_max_delay_seconds,
             "passive_update_receiver": self.passive_update_receiver,
             "entity_cache_warmup_dialogs": self.entity_cache_warmup_dialogs,
+            "health_ping_interval_seconds": self.health_ping_interval_seconds,
+            "health_get_state_interval_seconds": self.health_get_state_interval_seconds,
+            "health_get_difference_interval_seconds": self.health_get_difference_interval_seconds,
             "require_connection_health_before_auth": self.require_connection_health_before_auth,
             "connection_health_timeout_seconds": self.connection_health_timeout_seconds,
         }
@@ -422,7 +491,7 @@ def normalize_account_name(account: str | None) -> str:
 
 def normalize_app_version(app_version: str | None) -> str:
     if not app_version or app_version == "tg-api-zapret":
-        return __version__
+        return OFFICIAL_DESKTOP_APP_VERSION
     return app_version
 
 

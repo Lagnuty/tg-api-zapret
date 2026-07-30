@@ -12,7 +12,7 @@ from telethon.tl.custom.dialog import Dialog
 from telethon.tl.custom.message import Message
 
 from tg_api_zapret.config import TelegramConfig
-from tg_api_zapret.sessions import FileSessionBackend, SessionBackend
+from tg_api_zapret.sessions import FileSessionBackend, SessionBackend, SessionFileLock
 
 UpdateHandler = Callable[[events.NewMessage.Event], Awaitable[None] | None]
 
@@ -32,35 +32,45 @@ class TelegramLayer:
         self.config = config or TelegramConfig.from_env()
         self.session_backend = session_backend or FileSessionBackend("telegram.session.txt")
         self._client: TelegramClient | None = None
+        self._session_lock = SessionFileLock(self.session_backend.lock_path())
 
     async def connect(self) -> "TelegramLayer":
         if self._client and self._client.is_connected():
             return self
 
-        self._client = TelegramClient(
-            self.session_backend.client_session(),
-            self.config.api_id,
-            self.config.api_hash,
-            device_model=self.config.device_model,
-            system_version=self.config.system_version,
-            app_version=self.config.app_version,
-            lang_code=self.config.lang_code,
-            system_lang_code=self.config.system_lang_code,
-            request_retries=self.config.request_retries,
-            connection_retries=self.config.connection_retries,
-            retry_delay=self.config.retry_delay,
-            timeout=self.config.timeout,
-            proxy=self.config.proxy,
-        )
-        await self._client.connect()
-        self._persist_session()
+        self._session_lock.acquire()
+        try:
+            self._client = TelegramClient(
+                self.session_backend.client_session(),
+                self.config.api_id,
+                self.config.api_hash,
+                device_model=self.config.device_model,
+                system_version=self.config.system_version,
+                app_version=self.config.app_version,
+                lang_code=self.config.lang_code,
+                system_lang_code=self.config.system_lang_code,
+                request_retries=self.config.request_retries,
+                connection_retries=self.config.connection_retries,
+                retry_delay=self.config.retry_delay,
+                timeout=self.config.timeout,
+                proxy=self.config.proxy,
+            )
+            await self._client.connect()
+            self._persist_session()
+        except Exception:
+            self._session_lock.release()
+            raise
         return self
 
     async def disconnect(self) -> None:
         if not self._client:
+            self._session_lock.release()
             return
-        self._persist_session()
-        await self._client.disconnect()
+        try:
+            self._persist_session()
+            await self._client.disconnect()
+        finally:
+            self._session_lock.release()
 
     @asynccontextmanager
     async def lifespan(self) -> AsyncIterator["TelegramLayer"]:

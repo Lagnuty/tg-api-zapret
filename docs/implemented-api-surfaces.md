@@ -1,4 +1,4 @@
-# tg-api-zapret 0.4.17 implemented API surfaces
+# tg-api-zapret 0.4.18 implemented API surfaces
 
 ## Compatibility levels
 

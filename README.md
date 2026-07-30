@@ -156,7 +156,7 @@ HTTP API.
 ## Имя в авторизованных приложениях Telegram
 
 По умолчанию прослойка авторизуется с `device_model=Telegram Desktop` и
-`app_version`, равным текущей версии `tg-api-zapret`. Это имя Telegram обычно
+`app_version`, равным актуальной версии Telegram Desktop. Это имя Telegram обычно
 показывает в списке активных устройств.
 
 Изменить профиль клиента:
@@ -164,8 +164,8 @@ HTTP API.
 ```bash
 python -m tg_api_zapret set-client-profile \
   --device-model "Telegram Desktop" \
-  --system-version "Linux x86_64" \
-  --app-version 0.4.17
+  --system-version "Linux 5.15 x86_64" \
+  --app-version 7.0.4
 ```
 
 Для уже существующей сессии Telegram может оставить старое название. Надежный
