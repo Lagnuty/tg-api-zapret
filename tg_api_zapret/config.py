@@ -48,7 +48,10 @@ def detect_lang_code() -> str:
 
 
 def normalize_locale_code(value: str) -> str:
-    normalized = value.replace("_", "-").strip()
+    normalized = value.strip()
+    if not normalized or normalized.upper() in {"C", "POSIX", "C.UTF-8"}:
+        return "en-US"
+    normalized = normalized.split(".", 1)[0].split("@", 1)[0].replace("_", "-")
     if not normalized:
         return "en-US"
     parts = normalized.split("-", 1)

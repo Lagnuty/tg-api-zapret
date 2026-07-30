@@ -41,6 +41,9 @@ def test_normalize_locale_code_handles_windows_language_names() -> None:
     assert normalize_locale_code("Russian_Russia") == "ru-RU"
     assert normalize_locale_code("Ukrainian_Ukraine") == "uk-UA"
     assert normalize_locale_code("en_US") == "en-US"
+    assert normalize_locale_code("C") == "en-US"
+    assert normalize_locale_code("POSIX") == "en-US"
+    assert normalize_locale_code("ru_RU.UTF-8@variant") == "ru-RU"
 
 
 @pytest.mark.parametrize(

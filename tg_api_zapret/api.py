@@ -5,6 +5,7 @@ import base64
 from contextlib import asynccontextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import replace
+from datetime import datetime
 import hashlib
 import json
 import os
@@ -101,10 +102,12 @@ class ApiState:
         self.entity_cache: dict[str, dict[str, dict[str, Any]]] = {}
         self.connection_health: dict[str, dict[str, Any]] = {}
         self.account_states: dict[str, dict[str, Any]] = {}
+        self.sync_states: dict[str, dict[str, int]] = {}
 
     async def startup(self) -> None:
         service = self.settings().service
         self.load_entity_cache()
+        self.load_sync_states()
         if service.queue_execute_in_api and not self.queue.runs_inline:
             self.start_queue_worker()
         for account in service.auto_connect_accounts:
@@ -120,7 +123,6 @@ class ApiState:
                     "error": str(exc),
                     "last_check_ts": int(time.time()),
                 }
-
     def settings(self) -> AppSettings:
         return AppSettings.load(self.config_file)
 
@@ -342,7 +344,7 @@ class ApiState:
                 layer = await self.require_layer(account)
                 client = await layer.authorized_client()
                 if not client.is_connected():
-                    self.set_account_state(account, "connecting")
+                    self.set_account_state(account, "reconnecting")
                     await layer.connect()
                 authorized = await layer.is_authorized()
                 if authorized:
@@ -382,7 +384,6 @@ class ApiState:
         next_ping = 0.0
         next_state = 0.0
         next_difference = 0.0
-        last_state: Any = None
         while True:
             service = self.settings().service
             try:
@@ -398,16 +399,22 @@ class ApiState:
                     await client(functions.PingRequest(ping_id=random.getrandbits(63)))
                     next_ping = now + max(15, service.health_ping_interval_seconds)
                 if now >= next_state:
-                    last_state = await client(functions.updates.GetStateRequest())
+                    state_result = await client(functions.updates.GetStateRequest())
+                    self.update_sync_state_from_object(account, state_result)
                     next_state = now + max(60, service.health_get_state_interval_seconds)
-                if now >= next_difference and last_state is not None:
-                    await client(
+                if now >= next_difference:
+                    sync_state = self.sync_states.get(account)
+                    if sync_state is None:
+                        state_result = await client(functions.updates.GetStateRequest())
+                        sync_state = self.update_sync_state_from_object(account, state_result)
+                    difference = await client(
                         functions.updates.GetDifferenceRequest(
-                            pts=getattr(last_state, "pts", 0),
-                            date=getattr(last_state, "date", 0),
-                            qts=getattr(last_state, "qts", 0),
+                            pts=sync_state.get("pts", 0),
+                            date=sync_state.get("date", 0),
+                            qts=sync_state.get("qts", 0),
                         )
                     )
+                    self.apply_difference(account, difference)
                     next_difference = now + max(120, service.health_get_difference_interval_seconds)
                 self.connection_health.setdefault(account, {})
                 self.connection_health[account].update(
@@ -419,7 +426,8 @@ class ApiState:
                     }
                 )
                 self.set_account_state(account, "authorized")
-                await asyncio.sleep(5)
+                next_deadline = min(next_ping, next_state, next_difference)
+                await asyncio.sleep(max(0.1, min(5.0, next_deadline - time.monotonic())))
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -446,6 +454,7 @@ class ApiState:
         client = await layer.authorized_client()
 
         async def handler(event: Any) -> None:
+            self.apply_raw_update(account_name, event)
             self.online_status.setdefault(account_name, {})
             self.online_status[account_name].update(
                 {
@@ -524,15 +533,158 @@ class ApiState:
             )
         return result
 
+    def load_sync_states(self) -> None:
+        path = self.state_db_path()
+        if not path.exists():
+            return
+        try:
+            with self.open_state_db() as connection:
+                rows = connection.execute("select account, pts, date, qts from sync_state").fetchall()
+        except sqlite3.Error:
+            self.backup_corrupt_state_db()
+            return
+        self.sync_states = {
+            normalize_account_name(account): {"pts": int(pts), "date": int(date), "qts": int(qts)}
+            for account, pts, date, qts in rows
+        }
+
+    def update_sync_state_from_object(self, account: str, value: Any) -> dict[str, int]:
+        current = self.sync_states.get(account, {"pts": 0, "date": 0, "qts": 0})
+        state = {
+            "pts": int(getattr(value, "pts", current["pts"]) or current["pts"]),
+            "date": to_unix_timestamp(getattr(value, "date", current["date"]) or current["date"]),
+            "qts": int(getattr(value, "qts", current["qts"]) or current["qts"]),
+        }
+        self.sync_states[account] = state
+        self.save_sync_state(account, state)
+        return state
+
+    def save_sync_state(self, account: str, state: dict[str, int]) -> None:
+        path = self.state_db_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with self.open_state_db() as connection:
+            connection.execute(
+                """
+                insert into sync_state(account, pts, date, qts, updated_ts)
+                values(?, ?, ?, ?, ?)
+                on conflict(account) do update set
+                    pts = excluded.pts,
+                    date = excluded.date,
+                    qts = excluded.qts,
+                    updated_ts = excluded.updated_ts
+                """,
+                (account, state["pts"], state["date"], state["qts"], int(time.time())),
+            )
+
+    def apply_difference(self, account: str, difference: Any) -> None:
+        self.persist_update_bundle(account, "difference", difference)
+        state = getattr(difference, "state", None) or getattr(difference, "intermediate_state", None)
+        if state is not None:
+            self.update_sync_state_from_object(account, state)
+        for user in getattr(difference, "users", []) or []:
+            self.persist_entity(account, user)
+        for chat in getattr(difference, "chats", []) or []:
+            self.persist_entity(account, chat)
+        for message in getattr(difference, "new_messages", []) or []:
+            self.persist_message(account, message)
+        for update in getattr(difference, "other_updates", []) or []:
+            self.apply_update_object(account, update)
+
+    def apply_raw_update(self, account: str, event: Any) -> None:
+        update = getattr(event, "original_update", event)
+        self.apply_update_object(account, update)
+
+    def apply_update_object(self, account: str, update: Any) -> None:
+        self.persist_update_bundle(account, type(update).__name__, update)
+        pts = getattr(update, "pts", None)
+        if pts is not None:
+            current = self.sync_states.get(account, {"pts": 0, "date": 0, "qts": 0})
+            current["pts"] = max(int(current.get("pts", 0)), int(pts))
+            date_value = getattr(update, "date", None)
+            if date_value is not None:
+                current["date"] = max(int(current.get("date", 0)), to_unix_timestamp(date_value))
+            qts = getattr(update, "qts", None)
+            if qts is not None:
+                current["qts"] = max(int(current.get("qts", 0)), int(qts))
+            self.sync_states[account] = current
+            self.save_sync_state(account, current)
+        message = getattr(update, "message", None)
+        if message is not None:
+            self.persist_message(account, message)
+        user = getattr(update, "user", None)
+        if user is not None:
+            self.persist_entity(account, user)
+        chat = getattr(update, "chat", None)
+        if chat is not None:
+            self.persist_entity(account, chat)
+
+    def persist_update_bundle(self, account: str, kind: str, value: Any) -> None:
+        payload = serialize_tl(value)
+        with self.open_state_db() as connection:
+            connection.execute(
+                """
+                insert into raw_updates(account, kind, payload_json, created_ts)
+                values(?, ?, ?, ?)
+                """,
+                (account, kind, safe_json_dumps(payload), int(time.time())),
+            )
+
+    def persist_message(self, account: str, message: Any) -> None:
+        message_id = getattr(message, "id", None)
+        peer_id = getattr(message, "peer_id", None) or getattr(message, "chat_id", None)
+        peer_key = str(serialize_tl(peer_id)) if peer_id is not None else ""
+        payload = serialize_tl(message)
+        with self.open_state_db() as connection:
+            connection.execute(
+                """
+                insert into messages(account, peer_key, message_id, payload_json, updated_ts)
+                values(?, ?, ?, ?, ?)
+                on conflict(account, peer_key, message_id) do update set
+                    payload_json = excluded.payload_json,
+                    updated_ts = excluded.updated_ts
+                """,
+                (account, peer_key, int(message_id or 0), safe_json_dumps(payload), int(time.time())),
+            )
+
+    def persist_entity(self, account: str, entity: Any) -> None:
+        entity_id = getattr(entity, "id", None)
+        if entity_id is None:
+            return
+        payload = serialize_tl(entity)
+        entity_key = str(entity_id)
+        self.entity_cache.setdefault(account, {})[entity_key] = payload
+        username = payload.get("username") if isinstance(payload, dict) else None
+        if username:
+            self.entity_cache[account][f"@{username}".lower()] = payload
+            self.entity_cache[account][str(username).lower()] = payload
+        with self.open_state_db() as connection:
+            connection.execute(
+                """
+                insert into entities(account, entity_id, kind, payload_json, updated_ts)
+                values(?, ?, ?, ?, ?)
+                on conflict(account, entity_id) do update set
+                    kind = excluded.kind,
+                    payload_json = excluded.payload_json,
+                    updated_ts = excluded.updated_ts
+                """,
+                (
+                    account,
+                    entity_key,
+                    type(entity).__name__,
+                    safe_json_dumps(payload),
+                    int(time.time()),
+                ),
+            )
+
     def load_entity_cache(self) -> None:
         path = self.state_db_path()
         if not path.exists():
             return
         try:
-            with sqlite3.connect(path) as connection:
-                self.ensure_state_schema(connection)
+            with self.open_state_db() as connection:
                 rows = connection.execute("select account, cache_json from entity_cache").fetchall()
         except sqlite3.Error:
+            self.backup_corrupt_state_db()
             return
         cache: dict[str, dict[str, dict[str, Any]]] = {}
         for account, cache_json in rows:
@@ -547,8 +699,7 @@ class ApiState:
     def save_entity_cache(self) -> None:
         path = self.state_db_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        with sqlite3.connect(path) as connection:
-            self.ensure_state_schema(connection)
+        with self.open_state_db() as connection:
             for account, entities in self.entity_cache.items():
                 connection.execute(
                     """
@@ -564,14 +715,92 @@ class ApiState:
     def state_db_path(self) -> Path:
         return self.config_file.with_suffix(".state.sqlite3")
 
+    def open_state_db(self) -> sqlite3.Connection:
+        path = self.state_db_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(path)
+        self.ensure_state_schema(connection)
+        return connection
+
+    def backup_corrupt_state_db(self) -> None:
+        path = self.state_db_path()
+        if not path.exists():
+            return
+        backup = path.with_suffix(path.suffix + f".corrupt.{int(time.time())}")
+        try:
+            path.replace(backup)
+        except OSError:
+            pass
+
     @staticmethod
     def ensure_state_schema(connection: sqlite3.Connection) -> None:
+        connection.execute(
+            """
+            create table if not exists schema_meta(
+                key text primary key,
+                value text not null
+            )
+            """
+        )
+        connection.execute(
+            """
+            insert into schema_meta(key, value)
+            values('schema_version', '1')
+            on conflict(key) do nothing
+            """
+        )
         connection.execute(
             """
             create table if not exists entity_cache(
                 account text primary key,
                 cache_json text not null,
                 updated_ts integer not null
+            )
+            """
+        )
+        connection.execute(
+            """
+            create table if not exists sync_state(
+                account text primary key,
+                pts integer not null default 0,
+                date integer not null default 0,
+                qts integer not null default 0,
+                updated_ts integer not null
+            )
+            """
+        )
+        connection.execute(
+            """
+            create table if not exists raw_updates(
+                id integer primary key autoincrement,
+                account text not null,
+                kind text not null,
+                payload_json text not null,
+                created_ts integer not null
+            )
+            """
+        )
+        connection.execute(
+            """
+            create table if not exists messages(
+                account text not null,
+                peer_key text not null,
+                message_id integer not null,
+                payload_json text not null,
+                updated_ts integer not null,
+                primary key(account, peer_key, message_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            create table if not exists entities(
+                account text not null,
+                entity_id text not null,
+                kind text not null,
+                payload_json text not null,
+                updated_ts integer not null,
+                primary key(account, entity_id)
             )
             """
         )
@@ -2270,6 +2499,16 @@ def make_action_idempotency_key(account: str, action: str, value: str | None) ->
     if not value:
         return None
     return f"{account}:{action}:{value}"
+
+
+def safe_json_dumps(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, default=str)
+
+
+def to_unix_timestamp(value: Any) -> int:
+    if isinstance(value, datetime):
+        return int(value.timestamp())
+    return int(value or 0)
 
 
 def check_bucket(
