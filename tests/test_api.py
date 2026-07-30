@@ -1,5 +1,7 @@
+import asyncio
 from types import SimpleNamespace
 
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from telethon.tl.types import User
 
@@ -138,3 +140,61 @@ def test_telegram_action_limits_are_risk_weighted() -> None:
     assert telegram_action_limit(service, "raw.invoke") == (3, 60)
     assert telegram_action_limit(service, "chats.join") == (5, 3600)
     assert telegram_action_limit(service, "admin.ban") == (10, 3600)
+
+
+def test_connect_enters_locked_path_without_recursive_connect(tmp_path, monkeypatch) -> None:
+    state = ApiState(config_file=str(tmp_path / "config.json"), session_file=str(tmp_path / "s.txt"))
+    sentinel = object()
+
+    async def fake_connect_locked(account_name: str):
+        assert account_name == "default"
+        assert state.connection_lock("default").locked()
+        return sentinel
+
+    monkeypatch.setattr(state, "_connect_locked", fake_connect_locked)
+
+    assert asyncio.run(state.connect("default")) is sentinel
+
+
+def test_idempotency_persists_and_validates_payload_hash(tmp_path) -> None:
+    config_file = tmp_path / "config.json"
+    state = ApiState(config_file=str(config_file), session_file=str(tmp_path / "s.txt"))
+
+    status, payload_hash, cached = state.begin_idempotent_action(
+        "default",
+        "messages.send",
+        "key-1",
+        {"text": "hello"},
+    )
+    assert status == "started"
+    assert cached is None
+    state.complete_idempotent_action(
+        "default",
+        "messages.send",
+        "key-1",
+        payload_hash,
+        {"id": 123, "text": "hello"},
+    )
+    state.close_state_db()
+
+    restarted = ApiState(config_file=str(config_file), session_file=str(tmp_path / "s.txt"))
+    status, _, cached = restarted.begin_idempotent_action(
+        "default",
+        "messages.send",
+        "key-1",
+        {"text": "hello"},
+    )
+    assert status == "completed"
+    assert cached == {"id": 123, "text": "hello"}
+
+    try:
+        restarted.begin_idempotent_action(
+            "default",
+            "messages.send",
+            "key-1",
+            {"text": "different"},
+        )
+    except HTTPException as exc:
+        assert exc.status_code == 409
+    else:
+        raise AssertionError("different payload must be rejected")

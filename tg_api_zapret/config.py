@@ -201,6 +201,8 @@ class ServiceSettings:
     connection_health_timeout_seconds: int = 20
     raw_updates_retention_days: int = 7
     flood_errors_retention_days: int = 30
+    idempotency_retention_hours: int = 48
+    idempotency_max_records: int = 10000
     state_retention_min_interval_hours: int = 12
     state_retention_max_interval_hours: int = 24
     state_vacuum_interval_hours: int = 24
@@ -390,6 +392,12 @@ class ServiceSettings:
             flood_errors_retention_days=int(
                 data.get("flood_errors_retention_days", cls.flood_errors_retention_days)
             ),
+            idempotency_retention_hours=int(
+                data.get("idempotency_retention_hours", cls.idempotency_retention_hours)
+            ),
+            idempotency_max_records=int(
+                data.get("idempotency_max_records", cls.idempotency_max_records)
+            ),
             state_retention_min_interval_hours=int(
                 data.get(
                     "state_retention_min_interval_hours",
@@ -472,6 +480,8 @@ class ServiceSettings:
             "connection_health_timeout_seconds": self.connection_health_timeout_seconds,
             "raw_updates_retention_days": self.raw_updates_retention_days,
             "flood_errors_retention_days": self.flood_errors_retention_days,
+            "idempotency_retention_hours": self.idempotency_retention_hours,
+            "idempotency_max_records": self.idempotency_max_records,
             "state_retention_min_interval_hours": self.state_retention_min_interval_hours,
             "state_retention_max_interval_hours": self.state_retention_max_interval_hours,
             "state_vacuum_interval_hours": self.state_vacuum_interval_hours,

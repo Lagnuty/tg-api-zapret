@@ -92,7 +92,6 @@ class ApiState:
         self.connection_locks: dict[str, asyncio.Lock] = {}
         self.telegram_auth_rate_limits: dict[str, list[float]] = {}
         self.telegram_cooldowns: dict[str, dict[str, Any]] = {}
-        self.idempotency_results: dict[str, dict[str, Any]] = {}
         self.last_telegram_action_at: dict[str, float] = {}
         self.bot_updates: dict[str, list[dict[str, Any]]] = {}
         self.bot_update_ids: dict[str, int] = {}
@@ -106,6 +105,9 @@ class ApiState:
         self.next_online_allowed_at: dict[str, float] = {}
         self.reconnect_tasks: dict[str, asyncio.Task[None]] = {}
         self.retention_task: asyncio.Task[None] | None = None
+        self.db_writer_task: asyncio.Task[None] | None = None
+        self.db_write_queue: asyncio.Queue[tuple[Any, tuple[Any, ...], dict[str, Any], asyncio.Future[Any] | None]] = asyncio.Queue()
+        self.db_writer_status: dict[str, Any] = {}
         self.last_state_vacuum_at: float = 0.0
         self.queue_worker_task: asyncio.Task[None] | None = None
         self.queue_worker_status: dict[str, Any] = {}
@@ -122,6 +124,7 @@ class ApiState:
         await asyncio.to_thread(self.load_entity_cache)
         await asyncio.to_thread(self.load_sync_states)
         await asyncio.to_thread(self.prune_state_retention)
+        self.start_db_writer()
         self.start_retention_loop()
         if service.queue_execute_in_api and not self.queue.runs_inline:
             self.start_queue_worker()
@@ -151,7 +154,11 @@ class ApiState:
 
     async def _connect_locked(self, account_name: str) -> TelegramLayer:
         existing = self.layers.get(account_name)
-        if existing and await existing.is_connected():
+        if existing and await self.layer_is_usable(existing):
+            self.set_account_state(
+                account_name,
+                "authorized" if await existing.is_authorized() else "connected",
+            )
             return existing
         settings = self.settings()
         self.set_account_state(account_name, "connecting")
@@ -185,6 +192,18 @@ class ApiState:
             self.set_account_state(account_name, "disconnected")
         return layer
 
+    async def layer_is_usable(self, layer: TelegramLayer) -> bool:
+        try:
+            if not await layer.is_connected():
+                return False
+            if not await layer.is_authorized():
+                return True
+            client = await layer.authorized_client()
+            await client(functions.PingRequest(ping_id=random.getrandbits(63)))
+            return True
+        except Exception:
+            return False
+
     async def disconnect(self, account: str | None = None) -> None:
         if account is None:
             for account_name in list(self.online_tasks):
@@ -194,6 +213,7 @@ class ApiState:
             for account_name in list(self.idle_offline_tasks):
                 await self.stop_idle_offline_timer(account_name)
             await self.stop_retention_loop()
+            await self.stop_db_writer()
             await self.stop_queue_worker()
             for account_name in list(self.update_handlers):
                 await self.stop_passive_update_receiver(account_name)
@@ -328,6 +348,68 @@ class ApiState:
         if self.queue_worker_status:
             self.queue_worker_status.update({"running": False, "stopped_ts": int(time.time())})
 
+    def start_db_writer(self) -> None:
+        task = self.db_writer_task
+        if task and not task.done():
+            return
+        self.db_writer_task = asyncio.create_task(self._db_writer_loop())
+        self.db_writer_status = {"running": True, "started_ts": int(time.time()), "queued": 0}
+
+    async def stop_db_writer(self) -> None:
+        task = self.db_writer_task
+        self.db_writer_task = None
+        if task:
+            await self.db_write_queue.join()
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        if self.db_writer_status:
+            self.db_writer_status.update({"running": False, "stopped_ts": int(time.time())})
+
+    async def _db_writer_loop(self) -> None:
+        while True:
+            func, args, kwargs, future = await self.db_write_queue.get()
+            try:
+                result = await asyncio.to_thread(func, *args, **kwargs)
+                if future and not future.done():
+                    future.set_result(result)
+                self.db_writer_status.update(
+                    {"running": True, "queued": self.db_write_queue.qsize(), "last_write_ts": int(time.time())}
+                )
+            except asyncio.CancelledError:
+                if future and not future.done():
+                    future.cancel()
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "DB writer failed: type=%s ts=%s path=%s",
+                    type(exc).__name__,
+                    int(time.time()),
+                    self.state_db_path(),
+                    exc_info=True,
+                )
+                if future and not future.done():
+                    future.set_exception(exc)
+            finally:
+                self.db_write_queue.task_done()
+
+    async def enqueue_db_write(
+        self,
+        func: Any,
+        *args: Any,
+        wait: bool = True,
+        **kwargs: Any,
+    ) -> Any:
+        if not self.db_writer_task or self.db_writer_task.done():
+            self.start_db_writer()
+        loop = asyncio.get_running_loop()
+        future = loop.create_future() if wait else None
+        await self.db_write_queue.put((func, args, kwargs, future))
+        self.db_writer_status.update({"queued": self.db_write_queue.qsize()})
+        if future is None:
+            return None
+        return await future
+
     def start_retention_loop(self) -> None:
         task = self.retention_task
         if task and not task.done():
@@ -358,7 +440,13 @@ class ApiState:
                     self.state_db_path(),
                     exc_info=True,
                 )
-                await asyncio.sleep(300)
+                if is_non_retryable_retention_error(exc):
+                    if isinstance(exc, PermissionError):
+                        logger.error("State retention disabled after permission error: path=%s", self.state_db_path())
+                        return
+                    continue
+                retry_seconds = 30 if is_sqlite_locked_error(exc) else 300
+                await asyncio.sleep(retry_seconds)
                 try:
                     await asyncio.to_thread(self.prune_state_retention)
                 except Exception as retry_exc:
@@ -437,7 +525,7 @@ class ApiState:
         client = await layer.authorized_client()
 
         async def handler(event: Any) -> None:
-            await asyncio.to_thread(self.apply_raw_update, account_name, event)
+            await self.enqueue_db_write(self.apply_raw_update, account_name, event, wait=False)
             self.online_status.setdefault(account_name, {})
             self.online_status[account_name].update(
                 {
@@ -473,13 +561,13 @@ class ApiState:
         for dialog in dialogs:
             serialized = serialize_dialog(dialog)
             cache[str(serialized["id"])] = serialized
-            self.persist_dialog(account_name, serialized)
+            await self.enqueue_db_write(self.persist_dialog, account_name, serialized)
             username = serialized.get("username")
             if username:
                 cache[f"@{username}".lower()] = serialized
                 cache[str(username).lower()] = serialized
         self.entity_cache[account_name] = cache
-        self.save_entity_cache()
+        await self.enqueue_db_write(self.save_entity_cache)
         return {
             "account": account_name,
             "cached": len(cache),
@@ -934,8 +1022,13 @@ class ApiState:
             if self._state_db is None:
                 self._state_db = sqlite3.connect(path, check_same_thread=False)
                 self._state_db.execute("pragma journal_mode=wal")
-                self._state_db.execute("pragma auto_vacuum=incremental")
                 self._state_db.execute("pragma busy_timeout=5000")
+                auto_vacuum = int(self._state_db.execute("pragma auto_vacuum").fetchone()[0] or 0)
+                if auto_vacuum == 0:
+                    self._state_db.execute("pragma auto_vacuum=incremental")
+                    self._state_db.execute("vacuum")
+                elif auto_vacuum != 2:
+                    self._state_db.execute("pragma auto_vacuum=incremental")
                 self.ensure_state_schema(self._state_db)
             return self._state_db
 
@@ -958,9 +1051,23 @@ class ApiState:
         now = int(time.time())
         raw_cutoff = now - max(1, service.raw_updates_retention_days) * 86400
         flood_cutoff = now - max(1, service.flood_errors_retention_days) * 86400
+        idempotency_cutoff = now - max(1, service.idempotency_retention_hours) * 3600
         with self.state_db_context() as connection:
             connection.execute("delete from raw_updates where created_ts < ?", (raw_cutoff,))
             connection.execute("delete from flood_errors where created_ts < ?", (flood_cutoff,))
+            connection.execute("delete from idempotency_keys where updated_ts < ?", (idempotency_cutoff,))
+            max_records = max(1, service.idempotency_max_records)
+            connection.execute(
+                """
+                delete from idempotency_keys
+                where rowid in (
+                    select rowid from idempotency_keys
+                    order by updated_ts desc
+                    limit -1 offset ?
+                )
+                """,
+                (max_records,),
+            )
         vacuum_interval = max(1, service.state_vacuum_interval_hours) * 3600
         if time.monotonic() - self.last_state_vacuum_at < vacuum_interval:
             return
@@ -970,6 +1077,89 @@ class ApiState:
             if freelist_count > 0:
                 connection.execute(f"pragma incremental_vacuum({min(freelist_count, 1000)})")
             self.last_state_vacuum_at = time.monotonic()
+
+    def begin_idempotent_action(
+        self,
+        account: str,
+        action: str,
+        key: str | None,
+        payload: Any,
+    ) -> tuple[str, str | None, dict[str, Any] | None]:
+        if not key:
+            return "missing", None, None
+        payload_hash = idempotency_payload_hash(payload)
+        now = int(time.time())
+        with self.state_db_context() as connection:
+            row = connection.execute(
+                """
+                select payload_hash, status, result_json
+                from idempotency_keys
+                where account = ? and action = ? and idempotency_key = ?
+                """,
+                (account, action, key),
+            ).fetchone()
+            if row is not None:
+                stored_hash, status, result_json = row
+                if stored_hash != payload_hash:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Idempotency key was already used with a different payload.",
+                    )
+                if status == "completed":
+                    return "completed", payload_hash, json.loads(result_json or "{}")
+                raise HTTPException(
+                    status_code=409,
+                    detail="Idempotent request is already in progress.",
+                )
+            connection.execute(
+                """
+                insert into idempotency_keys(
+                    account, action, idempotency_key, payload_hash, status, created_ts, updated_ts
+                )
+                values(?, ?, ?, ?, 'in_progress', ?, ?)
+                """,
+                (account, action, key, payload_hash, now, now),
+            )
+        return "started", payload_hash, None
+
+    def complete_idempotent_action(
+        self,
+        account: str,
+        action: str,
+        key: str | None,
+        payload_hash: str | None,
+        result: dict[str, Any],
+    ) -> None:
+        if not key or not payload_hash:
+            return
+        with self.state_db_context() as connection:
+            connection.execute(
+                """
+                update idempotency_keys
+                set status = 'completed', result_json = ?, updated_ts = ?
+                where account = ? and action = ? and idempotency_key = ? and payload_hash = ?
+                """,
+                (safe_json_dumps(result), int(time.time()), account, action, key, payload_hash),
+            )
+
+    def clear_idempotent_action(
+        self,
+        account: str,
+        action: str,
+        key: str | None,
+        payload_hash: str | None,
+    ) -> None:
+        if not key or not payload_hash:
+            return
+        with self.state_db_context() as connection:
+            connection.execute(
+                """
+                delete from idempotency_keys
+                where account = ? and action = ? and idempotency_key = ? and payload_hash = ?
+                    and status = 'in_progress'
+                """,
+                (account, action, key, payload_hash),
+            )
 
     @staticmethod
     def ensure_state_schema(connection: sqlite3.Connection) -> None:
@@ -1075,6 +1265,21 @@ class ApiState:
                 telegram_retry_after_seconds integer not null,
                 retry_after_seconds integer not null,
                 created_ts integer not null
+            )
+            """
+        )
+        connection.execute(
+            """
+            create table if not exists idempotency_keys(
+                account text not null,
+                action text not null,
+                idempotency_key text not null,
+                payload_hash text not null,
+                status text not null,
+                result_json text,
+                created_ts integer not null,
+                updated_ts integer not null,
+                primary key(account, action, idempotency_key)
             )
             """
         )
@@ -1253,6 +1458,8 @@ class ServiceSettingsPayload(BaseModel):
     connection_health_timeout_seconds: int = Field(default=20, ge=1)
     raw_updates_retention_days: int = Field(default=7, ge=1)
     flood_errors_retention_days: int = Field(default=30, ge=1)
+    idempotency_retention_hours: int = Field(default=48, ge=1)
+    idempotency_max_records: int = Field(default=10000, ge=1)
     state_retention_min_interval_hours: int = Field(default=12, ge=1)
     state_retention_max_interval_hours: int = Field(default=24, ge=1)
     state_vacuum_interval_hours: int = Field(default=24, ge=1)
@@ -1939,7 +2146,7 @@ def create_app(state: ApiState) -> FastAPI:
                 qts=sync_state.get("qts", 0),
             )
         )
-        await asyncio.to_thread(state.apply_difference, account_name, difference)
+        await state.enqueue_db_write(state.apply_difference, account_name, difference)
         return {
             "account": account_name,
             "type": type(difference).__name__,
@@ -2023,8 +2230,8 @@ def create_app(state: ApiState) -> FastAPI:
         result = []
         for dialog in await layer.get_dialogs(limit=limit):
             serialized = serialize_dialog(dialog)
-            await asyncio.to_thread(state.persist_dialog, account_name, serialized)
-            await asyncio.to_thread(state.persist_entity, account_name, dialog.entity)
+            await state.enqueue_db_write(state.persist_dialog, account_name, serialized)
+            await state.enqueue_db_write(state.persist_entity, account_name, dialog.entity)
             result.append(serialized)
         return result
 
@@ -2063,25 +2270,49 @@ def create_app(state: ApiState) -> FastAPI:
         account: str | None = None,
     ) -> dict[str, Any]:
         ensure_telegram_rate(state, account, "messages.send")
+        account_name = state.resolve_account(account)
         idempotency_key = make_action_idempotency_key(
-            state.resolve_account(account),
+            account_name,
             "messages.send",
             payload.idempotency_key,
         )
-        if idempotency_key and idempotency_key in state.idempotency_results:
-            return state.idempotency_results[idempotency_key]
-        await state.mark_user_activity(account, send_online=True)
-        layer = await state.require_layer(account)
-        message = await retry_telegram_call(
-            lambda: layer.send_message(
-                payload.entity,
-                payload.text,
-                parse_mode=payload.parse_mode,
-            )
+        idem_status, payload_hash, cached_result = await asyncio.to_thread(
+            state.begin_idempotent_action,
+            account_name,
+            "messages.send",
+            idempotency_key,
+            payload.model_dump(),
         )
-        result = serialize_message(message)
-        if idempotency_key:
-            state.idempotency_results[idempotency_key] = result
+        if idem_status == "completed" and cached_result is not None:
+            return cached_result
+        await state.mark_user_activity(account, send_online=True)
+        try:
+            layer = await state.require_layer(account)
+            message = await retry_telegram_call(
+                lambda: layer.send_message(
+                    payload.entity,
+                    payload.text,
+                    parse_mode=payload.parse_mode,
+                )
+            )
+            result = serialize_message(message)
+            await asyncio.to_thread(
+                state.complete_idempotent_action,
+                account_name,
+                "messages.send",
+                idempotency_key,
+                payload_hash,
+                result,
+            )
+        except Exception:
+            await asyncio.to_thread(
+                state.clear_idempotent_action,
+                account_name,
+                "messages.send",
+                idempotency_key,
+                payload_hash,
+            )
+            raise
         return result
 
     @app.post("/messages/typing")
@@ -2116,7 +2347,7 @@ def create_app(state: ApiState) -> FastAPI:
                 max_id=payload.max_id,
             )
         )
-        await asyncio.to_thread(
+        await state.enqueue_db_write(
             state.persist_read_command,
             state.resolve_account(account),
             peer,
@@ -2150,25 +2381,49 @@ def create_app(state: ApiState) -> FastAPI:
         account: str | None = None,
     ) -> dict[str, Any]:
         ensure_telegram_rate(state, account, "messages.send")
+        account_name = state.resolve_account(account)
         idempotency_key = make_action_idempotency_key(
-            state.resolve_account(account),
+            account_name,
             "messages.send_username",
             payload.idempotency_key,
         )
-        if idempotency_key and idempotency_key in state.idempotency_results:
-            return state.idempotency_results[idempotency_key]
-        await state.mark_user_activity(account, send_online=True)
-        layer = await state.require_layer(account)
-        message = await retry_telegram_call(
-            lambda: layer.send_message(
-                normalize_username_entity(payload.username),
-                payload.text,
-                parse_mode=payload.parse_mode,
-            )
+        idem_status, payload_hash, cached_result = await asyncio.to_thread(
+            state.begin_idempotent_action,
+            account_name,
+            "messages.send_username",
+            idempotency_key,
+            payload.model_dump(),
         )
-        result = serialize_message(message)
-        if idempotency_key:
-            state.idempotency_results[idempotency_key] = result
+        if idem_status == "completed" and cached_result is not None:
+            return cached_result
+        await state.mark_user_activity(account, send_online=True)
+        try:
+            layer = await state.require_layer(account)
+            message = await retry_telegram_call(
+                lambda: layer.send_message(
+                    normalize_username_entity(payload.username),
+                    payload.text,
+                    parse_mode=payload.parse_mode,
+                )
+            )
+            result = serialize_message(message)
+            await asyncio.to_thread(
+                state.complete_idempotent_action,
+                account_name,
+                "messages.send_username",
+                idempotency_key,
+                payload_hash,
+                result,
+            )
+        except Exception:
+            await asyncio.to_thread(
+                state.clear_idempotent_action,
+                account_name,
+                "messages.send_username",
+                idempotency_key,
+                payload_hash,
+            )
+            raise
         return result
 
     @app.post("/messages/edit")
@@ -2247,29 +2502,53 @@ def create_app(state: ApiState) -> FastAPI:
         account: str | None = None,
     ) -> dict[str, Any]:
         ensure_telegram_rate(state, account, "media.send")
+        account_name = state.resolve_account(account)
         idempotency_key = make_action_idempotency_key(
-            state.resolve_account(account),
+            account_name,
             "media.send",
             payload.idempotency_key,
         )
-        if idempotency_key and idempotency_key in state.idempotency_results:
-            return state.idempotency_results[idempotency_key]
+        idem_status, payload_hash, cached_result = await asyncio.to_thread(
+            state.begin_idempotent_action,
+            account_name,
+            "media.send",
+            idempotency_key,
+            payload.model_dump(),
+        )
+        if idem_status == "completed" and cached_result is not None:
+            return cached_result
         await state.mark_user_activity(account, send_online=True)
-        client = await require_authorized_client(state, account)
-        file_value, cleanup = decode_upload_file(payload.file_path, payload.file_base64, payload.file_name)
         try:
-            message = await client.send_file(
-                payload.entity,
-                file_value,
-                caption=payload.caption,
-                parse_mode=payload.parse_mode,
+            client = await require_authorized_client(state, account)
+            file_value, cleanup = decode_upload_file(payload.file_path, payload.file_base64, payload.file_name)
+            try:
+                message = await client.send_file(
+                    payload.entity,
+                    file_value,
+                    caption=payload.caption,
+                    parse_mode=payload.parse_mode,
+                )
+            finally:
+                if cleanup:
+                    Path(cleanup).unlink(missing_ok=True)
+            result = serialize_message(message)
+            await asyncio.to_thread(
+                state.complete_idempotent_action,
+                account_name,
+                "media.send",
+                idempotency_key,
+                payload_hash,
+                result,
             )
-        finally:
-            if cleanup:
-                Path(cleanup).unlink(missing_ok=True)
-        result = serialize_message(message)
-        if idempotency_key:
-            state.idempotency_results[idempotency_key] = result
+        except Exception:
+            await asyncio.to_thread(
+                state.clear_idempotent_action,
+                account_name,
+                "media.send",
+                idempotency_key,
+                payload_hash,
+            )
+            raise
         return result
 
     @app.post("/media/download")
@@ -3055,11 +3334,35 @@ async def retry_telegram_call(call_factory: Any, *, max_attempts: int = 5) -> An
 def make_action_idempotency_key(account: str, action: str, value: str | None) -> str | None:
     if not value:
         return None
-    return f"{account}:{action}:{value}"
+    normalized = value.strip()
+    if not normalized:
+        return None
+    return normalized
+
+
+def idempotency_payload_hash(payload: Any) -> str:
+    return hashlib.sha256(safe_json_dumps(payload).encode("utf-8")).hexdigest()
+
+
+def is_sqlite_locked_error(exc: Exception) -> bool:
+    return isinstance(exc, sqlite3.OperationalError) and "database is locked" in str(exc).lower()
+
+
+def is_non_retryable_retention_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    if isinstance(exc, PermissionError):
+        return True
+    if isinstance(exc, sqlite3.OperationalError) and "disk" in message and "full" in message:
+        return True
+    if isinstance(exc, sqlite3.DatabaseError) and any(
+        marker in message for marker in ("schema", "malformed", "not a database")
+    ):
+        return True
+    return False
 
 
 def safe_json_dumps(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, default=str)
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
 
 
 def to_unix_timestamp(value: Any) -> int:
@@ -3242,49 +3545,97 @@ async def dispatch_rpc(state: ApiState, method: str, params: dict[str, Any]) -> 
         result = []
         for dialog in await layer.get_dialogs(limit=limit):
             serialized = serialize_dialog(dialog)
-            await asyncio.to_thread(state.persist_dialog, account_name, serialized)
-            await asyncio.to_thread(state.persist_entity, account_name, dialog.entity)
+            await state.enqueue_db_write(state.persist_dialog, account_name, serialized)
+            await state.enqueue_db_write(state.persist_entity, account_name, dialog.entity)
             result.append(serialized)
         return result
     if method == "messages.send":
         ensure_telegram_rate(state, account, "messages.send")
+        account_name = state.resolve_account(account)
         idempotency_key = make_action_idempotency_key(
-            state.resolve_account(account),
+            account_name,
             "messages.send",
             params.get("idempotency_key"),
         )
-        if idempotency_key and idempotency_key in state.idempotency_results:
-            return state.idempotency_results[idempotency_key]
-        await state.mark_user_activity(account, send_online=True)
-        layer = await state.require_layer(account)
-        message = await layer.send_message(
-            params["entity"],
-            params["text"],
-            parse_mode=params.get("parse_mode"),
+        idem_status, payload_hash, cached_result = await asyncio.to_thread(
+            state.begin_idempotent_action,
+            account_name,
+            "messages.send",
+            idempotency_key,
+            params,
         )
-        result = serialize_message(message)
-        if idempotency_key:
-            state.idempotency_results[idempotency_key] = result
+        if idem_status == "completed" and cached_result is not None:
+            return cached_result
+        await state.mark_user_activity(account, send_online=True)
+        try:
+            layer = await state.require_layer(account)
+            message = await layer.send_message(
+                params["entity"],
+                params["text"],
+                parse_mode=params.get("parse_mode"),
+            )
+            result = serialize_message(message)
+            await asyncio.to_thread(
+                state.complete_idempotent_action,
+                account_name,
+                "messages.send",
+                idempotency_key,
+                payload_hash,
+                result,
+            )
+        except Exception:
+            await asyncio.to_thread(
+                state.clear_idempotent_action,
+                account_name,
+                "messages.send",
+                idempotency_key,
+                payload_hash,
+            )
+            raise
         return result
     if method == "messages.send_username":
         ensure_telegram_rate(state, account, "messages.send")
+        account_name = state.resolve_account(account)
         idempotency_key = make_action_idempotency_key(
-            state.resolve_account(account),
+            account_name,
             "messages.send_username",
             params.get("idempotency_key"),
         )
-        if idempotency_key and idempotency_key in state.idempotency_results:
-            return state.idempotency_results[idempotency_key]
-        await state.mark_user_activity(account, send_online=True)
-        layer = await state.require_layer(account)
-        message = await layer.send_message(
-            normalize_username_entity(params["username"]),
-            params["text"],
-            parse_mode=params.get("parse_mode"),
+        idem_status, payload_hash, cached_result = await asyncio.to_thread(
+            state.begin_idempotent_action,
+            account_name,
+            "messages.send_username",
+            idempotency_key,
+            params,
         )
-        result = serialize_message(message)
-        if idempotency_key:
-            state.idempotency_results[idempotency_key] = result
+        if idem_status == "completed" and cached_result is not None:
+            return cached_result
+        await state.mark_user_activity(account, send_online=True)
+        try:
+            layer = await state.require_layer(account)
+            message = await layer.send_message(
+                normalize_username_entity(params["username"]),
+                params["text"],
+                parse_mode=params.get("parse_mode"),
+            )
+            result = serialize_message(message)
+            await asyncio.to_thread(
+                state.complete_idempotent_action,
+                account_name,
+                "messages.send_username",
+                idempotency_key,
+                payload_hash,
+                result,
+            )
+        except Exception:
+            await asyncio.to_thread(
+                state.clear_idempotent_action,
+                account_name,
+                "messages.send_username",
+                idempotency_key,
+                payload_hash,
+            )
+            raise
         return result
     if method == "messages.edit":
         ensure_telegram_rate(state, account, "messages.edit")
@@ -3318,33 +3669,57 @@ async def dispatch_rpc(state: ApiState, method: str, params: dict[str, Any]) -> 
         return {"entity": serialize_tl(entity), "input_entity": serialize_tl(input_entity)}
     if method == "media.send":
         ensure_telegram_rate(state, account, "media.send")
+        account_name = state.resolve_account(account)
         idempotency_key = make_action_idempotency_key(
-            state.resolve_account(account),
+            account_name,
             "media.send",
             params.get("idempotency_key"),
         )
-        if idempotency_key and idempotency_key in state.idempotency_results:
-            return state.idempotency_results[idempotency_key]
-        await state.mark_user_activity(account, send_online=True)
-        client = await require_authorized_client(state, account)
-        file_value, cleanup = decode_upload_file(
-            params.get("file_path"),
-            params.get("file_base64"),
-            params.get("file_name"),
+        idem_status, payload_hash, cached_result = await asyncio.to_thread(
+            state.begin_idempotent_action,
+            account_name,
+            "media.send",
+            idempotency_key,
+            params,
         )
+        if idem_status == "completed" and cached_result is not None:
+            return cached_result
+        await state.mark_user_activity(account, send_online=True)
         try:
-            message = await client.send_file(
-                params["entity"],
-                file_value,
-                caption=params.get("caption"),
-                parse_mode=params.get("parse_mode"),
+            client = await require_authorized_client(state, account)
+            file_value, cleanup = decode_upload_file(
+                params.get("file_path"),
+                params.get("file_base64"),
+                params.get("file_name"),
             )
-        finally:
-            if cleanup:
-                Path(cleanup).unlink(missing_ok=True)
-        result = serialize_message(message)
-        if idempotency_key:
-            state.idempotency_results[idempotency_key] = result
+            try:
+                message = await client.send_file(
+                    params["entity"],
+                    file_value,
+                    caption=params.get("caption"),
+                    parse_mode=params.get("parse_mode"),
+                )
+            finally:
+                if cleanup:
+                    Path(cleanup).unlink(missing_ok=True)
+            result = serialize_message(message)
+            await asyncio.to_thread(
+                state.complete_idempotent_action,
+                account_name,
+                "media.send",
+                idempotency_key,
+                payload_hash,
+                result,
+            )
+        except Exception:
+            await asyncio.to_thread(
+                state.clear_idempotent_action,
+                account_name,
+                "media.send",
+                idempotency_key,
+                payload_hash,
+            )
+            raise
         return result
     if method == "tl.construct":
         layer = await state.require_layer(account)
