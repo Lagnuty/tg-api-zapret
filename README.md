@@ -219,6 +219,11 @@ Current secure defaults:
 - `enable_raw_invoke=false` and `enable_layer_invoke=false`; enable them explicitly only for trusted admin use.
 - `GET /dialogs` includes `username`, `access_hash`, and `input_entity` when Telethon has enough data. Clients should prefer `username`; if only a numeric id is available, use `input_entity` so `access_hash` is preserved.
 
+Full integration references:
+
+- `docs/implemented-api-surfaces.md` - complete API surface and runtime semantics.
+- `docs/core-integration.md` - embedding tg-api-zapret as the Telegram core of another application.
+
 Minimal local run:
 
 ```bash
@@ -243,10 +248,11 @@ curl -X POST http://127.0.0.1:8080/messages/send-username \
   -d '{"username":"username_or_@username","text":"hello"}'
 ```
 
-Keep an authorized account connected and online until API shutdown or explicit disconnect.
-The desktop-like runtime also supports startup auto-connect, reconnect loops, passive MTProto
-update receivers, entity-cache warmup, and Telegram/proxy health checks before login code
-requests. Related endpoints: `GET /accounts/health`, `POST /accounts/entity-cache/warm`,
+Keep an authorized account connected until API shutdown or explicit disconnect.
+`keep_online` is an explicit option, not the default. The runtime also supports
+startup auto-connect, reconnect loops, passive MTProto update receivers,
+entity-cache warmup, and Telegram/proxy health checks before login code requests.
+Related endpoints: `GET /accounts/health`, `POST /accounts/entity-cache/warm`,
 `GET /accounts/entity-cache`.
 
 ```bash
@@ -275,7 +281,17 @@ http://127.0.0.1:8080/docs
 
 - `GET /accounts`
 - `POST /accounts`
+- `POST /accounts/connect`
+- `POST /accounts/disconnect`
+- `GET /accounts/online`
+- `GET /accounts/health`
+- `GET /accounts/risk-status`
+- `POST /accounts/entity-cache/warm`
+- `GET /accounts/entity-cache`
+- `GET /accounts/sync-state`
+- `POST /accounts/sync/difference?recovery=true`
 - `GET /health`
+- `GET /capabilities`
 - `GET /config`
 - `PUT /config/proxy`
 - `PUT /config/client-profile`
@@ -295,6 +311,7 @@ http://127.0.0.1:8080/docs
 - `POST /messages/reaction`
 - `POST /media/send`
 - `POST /media/download`
+- `POST /media/download/stream`
 - `POST /files/upload`
 - `POST /entities/resolve`
 - `POST /chats/join`
@@ -313,6 +330,7 @@ http://127.0.0.1:8080/docs
 - `POST /queue/jobs`
 - `GET /queue/jobs`
 - `GET /queue/jobs/{job_id}`
+- `GET /queue/status`
 - `GET /db/writer/status`
 - `GET /db/maintenance/status`
 - `POST /db/vacuum/migrate`
@@ -320,6 +338,9 @@ http://127.0.0.1:8080/docs
 - `GET /capabilities`
 - `POST /actions/resolve`
 - `POST /actions/execute`
+- `GET /compat/reverse-proxy`
+- `GET /bot{token}/{method}`
+- `POST /bot{token}/{method}`
 - `GET /app/settings`
 - `PUT /app/settings`
 - `PATCH /app/settings`
@@ -486,6 +507,18 @@ client = TgApiZapretClient()
 print(client.app_settings())
 client.update_app_settings(default_api_interface="json_rpc", stream_queue_size=250)
 ```
+
+Current embedded-core settings groups:
+
+- `require_api_token`, `api_token_env`, `api_tokens_env` - API auth and per-account token scopes.
+- `enable_raw_invoke`, `enable_layer_invoke` - privileged raw MTProto switches.
+- `telegram_safe_mode`, `telegram_serialize_account_actions`, `telegram_*` limits - Telegram action guardrails.
+- `queue_visibility_timeout_seconds`, `queue_default_max_attempts`, `queue_execute_in_api` - Queue API behavior.
+- `db_writer_queue_maxsize`, `db_writer_*_retries`, `db_writer_dead_letter_*`, `db_writer_degraded_queue_ratio` - DB writer lifecycle, retry, backpressure, dead-letter and degraded health.
+- `idempotency_*` - persistent idempotency TTL, lease, heartbeat and cached result size limit.
+- `activity_idle_*`, `online_debounce_*`, `keep_accounts_online` - presence lifecycle for real user activity.
+- `auto_connect_accounts`, `reconnect_*`, `passive_update_receiver` - account connection lifecycle.
+- `entity_cache_warmup_*`, `raw_updates_retention_days`, `flood_errors_retention_days`, `state_*` - local cache, retention and SQLite maintenance.
 
 ## Security Settings
 
@@ -679,7 +712,7 @@ Redis выбран как первый production backend: для текущег
 можно добавить позже тем же backend-интерфейсом, если понадобится отдельный
 кластер воркеров или pub/sub-шина.
 
-## Queue API 0.4.4 Details
+## Queue API Details
 
 Current queue semantics:
 
