@@ -11,7 +11,8 @@ from urllib.parse import urlparse
 
 OFFICIAL_DESKTOP_API_ID = 2040
 OFFICIAL_DESKTOP_API_HASH = "b18441a1ff607e10a989891a5462e627"
-OFFICIAL_DESKTOP_APP_VERSION = "7.0.4"
+OFFICIAL_DESKTOP_APP_VERSION = "7.0.6"
+OFFICIAL_DESKTOP_USER_AGENT = f"TelegramDesktop/{OFFICIAL_DESKTOP_APP_VERSION}"
 LANGUAGE_ALIASES = {
     "english": "en",
     "russian": "ru",
@@ -129,6 +130,7 @@ class ClientProfile:
             "device_model": self.device_model,
             "system_version": self.system_version,
             "app_version": self.app_version,
+            "desktop_user_agent": f"TelegramDesktop/{self.app_version}",
             "lang_code": self.lang_code,
             "system_lang_code": self.system_lang_code,
         }
@@ -169,6 +171,10 @@ class ServiceSettings:
     telegram_requests_per_second: int = 10
     telegram_requests_per_minute: int = 50
     telegram_requests_per_hour: int = 500
+    telegram_read_requests_per_second: int = 5
+    telegram_send_requests_per_second: int = 2
+    telegram_typing_requests_per_second: int = 1
+    telegram_sync_requests_per_minute: int = 2
     max_dialog_limit: int = 100
     max_message_limit: int = 100
     blocked_account_names: list[str] = field(default_factory=lambda: ["string", "account"])
@@ -186,20 +192,13 @@ class ServiceSettings:
     reconnect_min_delay_seconds: int = 5
     reconnect_max_delay_seconds: int = 120
     passive_update_receiver: bool = True
-    desktop_sync_enabled: bool = False
     entity_cache_warmup_dialogs: int = 50
     entity_cache_warmup_min_dialogs: int = 40
     entity_cache_warmup_max_dialogs: int = 60
-    health_ping_interval_seconds: int = 300
-    health_ping_max_interval_seconds: int = 600
-    health_get_state_interval_seconds: int = 180
-    health_get_state_max_interval_seconds: int = 300
-    health_get_difference_interval_seconds: int = 300
-    health_get_difference_max_interval_seconds: int = 600
-    health_dialog_refresh_interval_seconds: int = 3600
-    health_dialog_refresh_max_interval_seconds: int = 7200
     require_connection_health_before_auth: bool = True
     connection_health_timeout_seconds: int = 20
+    raw_updates_retention_days: int = 7
+    flood_errors_retention_days: int = 30
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "ServiceSettings":
@@ -280,6 +279,18 @@ class ServiceSettings:
             telegram_requests_per_hour=int(
                 data.get("telegram_requests_per_hour", cls.telegram_requests_per_hour)
             ),
+            telegram_read_requests_per_second=int(
+                data.get("telegram_read_requests_per_second", cls.telegram_read_requests_per_second)
+            ),
+            telegram_send_requests_per_second=int(
+                data.get("telegram_send_requests_per_second", cls.telegram_send_requests_per_second)
+            ),
+            telegram_typing_requests_per_second=int(
+                data.get("telegram_typing_requests_per_second", cls.telegram_typing_requests_per_second)
+            ),
+            telegram_sync_requests_per_minute=int(
+                data.get("telegram_sync_requests_per_minute", cls.telegram_sync_requests_per_minute)
+            ),
             max_dialog_limit=int(data.get("max_dialog_limit", cls.max_dialog_limit)),
             max_message_limit=int(data.get("max_message_limit", cls.max_message_limit)),
             blocked_account_names=[
@@ -335,7 +346,6 @@ class ServiceSettings:
             passive_update_receiver=bool(
                 data.get("passive_update_receiver", cls.passive_update_receiver)
             ),
-            desktop_sync_enabled=bool(data.get("desktop_sync_enabled", cls.desktop_sync_enabled)),
             entity_cache_warmup_dialogs=int(
                 data.get("entity_cache_warmup_dialogs", cls.entity_cache_warmup_dialogs)
             ),
@@ -344,48 +354,6 @@ class ServiceSettings:
             ),
             entity_cache_warmup_max_dialogs=int(
                 data.get("entity_cache_warmup_max_dialogs", cls.entity_cache_warmup_max_dialogs)
-            ),
-            health_ping_interval_seconds=int(
-                data.get("health_ping_interval_seconds", cls.health_ping_interval_seconds)
-            ),
-            health_ping_max_interval_seconds=int(
-                data.get("health_ping_max_interval_seconds", cls.health_ping_max_interval_seconds)
-            ),
-            health_get_state_interval_seconds=int(
-                data.get(
-                    "health_get_state_interval_seconds",
-                    cls.health_get_state_interval_seconds,
-                )
-            ),
-            health_get_state_max_interval_seconds=int(
-                data.get(
-                    "health_get_state_max_interval_seconds",
-                    cls.health_get_state_max_interval_seconds,
-                )
-            ),
-            health_get_difference_interval_seconds=int(
-                data.get(
-                    "health_get_difference_interval_seconds",
-                    cls.health_get_difference_interval_seconds,
-                )
-            ),
-            health_get_difference_max_interval_seconds=int(
-                data.get(
-                    "health_get_difference_max_interval_seconds",
-                    cls.health_get_difference_max_interval_seconds,
-                )
-            ),
-            health_dialog_refresh_interval_seconds=int(
-                data.get(
-                    "health_dialog_refresh_interval_seconds",
-                    cls.health_dialog_refresh_interval_seconds,
-                )
-            ),
-            health_dialog_refresh_max_interval_seconds=int(
-                data.get(
-                    "health_dialog_refresh_max_interval_seconds",
-                    cls.health_dialog_refresh_max_interval_seconds,
-                )
             ),
             require_connection_health_before_auth=bool(
                 data.get(
@@ -398,6 +366,12 @@ class ServiceSettings:
                     "connection_health_timeout_seconds",
                     cls.connection_health_timeout_seconds,
                 )
+            ),
+            raw_updates_retention_days=int(
+                data.get("raw_updates_retention_days", cls.raw_updates_retention_days)
+            ),
+            flood_errors_retention_days=int(
+                data.get("flood_errors_retention_days", cls.flood_errors_retention_days)
             ),
         )
 
@@ -434,6 +408,10 @@ class ServiceSettings:
             "telegram_requests_per_second": self.telegram_requests_per_second,
             "telegram_requests_per_minute": self.telegram_requests_per_minute,
             "telegram_requests_per_hour": self.telegram_requests_per_hour,
+            "telegram_read_requests_per_second": self.telegram_read_requests_per_second,
+            "telegram_send_requests_per_second": self.telegram_send_requests_per_second,
+            "telegram_typing_requests_per_second": self.telegram_typing_requests_per_second,
+            "telegram_sync_requests_per_minute": self.telegram_sync_requests_per_minute,
             "max_dialog_limit": self.max_dialog_limit,
             "max_message_limit": self.max_message_limit,
             "blocked_account_names": self.blocked_account_names,
@@ -451,20 +429,13 @@ class ServiceSettings:
             "reconnect_min_delay_seconds": self.reconnect_min_delay_seconds,
             "reconnect_max_delay_seconds": self.reconnect_max_delay_seconds,
             "passive_update_receiver": self.passive_update_receiver,
-            "desktop_sync_enabled": self.desktop_sync_enabled,
             "entity_cache_warmup_dialogs": self.entity_cache_warmup_dialogs,
             "entity_cache_warmup_min_dialogs": self.entity_cache_warmup_min_dialogs,
             "entity_cache_warmup_max_dialogs": self.entity_cache_warmup_max_dialogs,
-            "health_ping_interval_seconds": self.health_ping_interval_seconds,
-            "health_ping_max_interval_seconds": self.health_ping_max_interval_seconds,
-            "health_get_state_interval_seconds": self.health_get_state_interval_seconds,
-            "health_get_state_max_interval_seconds": self.health_get_state_max_interval_seconds,
-            "health_get_difference_interval_seconds": self.health_get_difference_interval_seconds,
-            "health_get_difference_max_interval_seconds": self.health_get_difference_max_interval_seconds,
-            "health_dialog_refresh_interval_seconds": self.health_dialog_refresh_interval_seconds,
-            "health_dialog_refresh_max_interval_seconds": self.health_dialog_refresh_max_interval_seconds,
             "require_connection_health_before_auth": self.require_connection_health_before_auth,
             "connection_health_timeout_seconds": self.connection_health_timeout_seconds,
+            "raw_updates_retention_days": self.raw_updates_retention_days,
+            "flood_errors_retention_days": self.flood_errors_retention_days,
         }
 
 

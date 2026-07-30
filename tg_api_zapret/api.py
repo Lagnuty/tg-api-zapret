@@ -34,6 +34,7 @@ from tg_api_zapret.config import (
     AppSettings,
     ClientProfile,
     OFFICIAL_DESKTOP_APP_VERSION,
+    OFFICIAL_DESKTOP_USER_AGENT,
     ServiceSettings,
     TelegramConfig,
     detect_lang_code,
@@ -95,8 +96,11 @@ class ApiState:
         self.bot_update_handlers: dict[str, tuple[Any, Any]] = {}
         self.online_tasks: dict[str, asyncio.Task[None]] = {}
         self.online_status: dict[str, dict[str, Any]] = {}
+        self.idle_offline_tasks: dict[str, asyncio.Task[None]] = {}
+        self.last_user_activity_at: dict[str, float] = {}
+        self.last_online_status_at: dict[str, float] = {}
+        self.next_online_allowed_at: dict[str, float] = {}
         self.reconnect_tasks: dict[str, asyncio.Task[None]] = {}
-        self.health_tasks: dict[str, asyncio.Task[None]] = {}
         self.queue_worker_task: asyncio.Task[None] | None = None
         self.queue_worker_status: dict[str, Any] = {}
         self.update_handlers: dict[str, tuple[Any, Any]] = {}
@@ -104,11 +108,13 @@ class ApiState:
         self.connection_health: dict[str, dict[str, Any]] = {}
         self.account_states: dict[str, dict[str, Any]] = {}
         self.sync_states: dict[str, dict[str, int]] = {}
+        self._state_db: sqlite3.Connection | None = None
 
     async def startup(self) -> None:
         service = self.settings().service
         self.load_entity_cache()
         self.load_sync_states()
+        self.prune_state_retention()
         if service.queue_execute_in_api and not self.queue.runs_inline:
             self.start_queue_worker()
         for account in service.auto_connect_accounts:
@@ -157,11 +163,9 @@ class ApiState:
         self.layers[account_name] = layer
         if account_name not in settings.accounts:
             self.save_settings(settings.with_account(account_name))
-        if settings.service.keep_accounts_online and await layer.is_authorized():
+        if await layer.is_authorized():
             self.set_account_state(account_name, "authorized")
             await self.activate_desktop_like_runtime(account_name)
-        elif await layer.is_authorized():
-            self.set_account_state(account_name, "authorized")
         else:
             self.set_account_state(account_name, "disconnected")
         return layer
@@ -172,8 +176,8 @@ class ApiState:
                 await self.stop_online_keepalive(account_name)
             for account_name in list(self.reconnect_tasks):
                 await self.stop_reconnect_loop(account_name)
-            for account_name in list(self.health_tasks):
-                await self.stop_desktop_sync_loop(account_name)
+            for account_name in list(self.idle_offline_tasks):
+                await self.stop_idle_offline_timer(account_name)
             await self.stop_queue_worker()
             for account_name in list(self.update_handlers):
                 await self.stop_passive_update_receiver(account_name)
@@ -181,11 +185,12 @@ class ApiState:
                 await layer.disconnect()
             self.layers.clear()
             await self.queue.close()
+            self.close_state_db()
             return
         account_name = self.resolve_account(account)
         await self.stop_online_keepalive(account_name)
         await self.stop_reconnect_loop(account_name)
-        await self.stop_desktop_sync_loop(account_name)
+        await self.stop_idle_offline_timer(account_name)
         await self.stop_passive_update_receiver(account_name)
         layer = self.layers.pop(account_name, None)
         if layer:
@@ -223,12 +228,10 @@ class ApiState:
             self.start_online_keepalive(account_name)
         if service.passive_update_receiver:
             await self.start_passive_update_receiver(account_name)
-        if service.entity_cache_warmup_dialogs > 0:
+        if service.entity_cache_warmup_dialogs > 0 and not self.entity_cache.get(account_name):
             await self.warm_entity_cache(account_name, limit=self.entity_cache_warmup_limit())
         if service.reconnect_enabled:
             self.start_reconnect_loop(account_name)
-        if service.desktop_sync_enabled:
-            self.start_desktop_sync_loop(account_name)
 
     async def stop_online_keepalive(self, account: str) -> None:
         account_name = self.resolve_account(account)
@@ -289,23 +292,6 @@ class ApiState:
             return
         self.reconnect_tasks[account_name] = asyncio.create_task(self._reconnect_loop(account_name))
 
-    def start_desktop_sync_loop(self, account: str) -> None:
-        account_name = self.resolve_account(account)
-        task = self.health_tasks.get(account_name)
-        if task and not task.done():
-            return
-        self.health_tasks[account_name] = asyncio.create_task(self._desktop_sync_loop(account_name))
-
-    async def stop_desktop_sync_loop(self, account: str) -> None:
-        account_name = self.resolve_account(account)
-        task = self.health_tasks.pop(account_name, None)
-        if task:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-
     def start_queue_worker(self) -> None:
         task = self.queue_worker_task
         if task and not task.done():
@@ -364,7 +350,7 @@ class ApiState:
                         "connected": client.is_connected(),
                         "last_check_ts": int(time.time()),
                     }
-                    if service.entity_cache_warmup_dialogs > 0:
+                    if service.entity_cache_warmup_dialogs > 0 and not self.entity_cache.get(account):
                         await self.warm_entity_cache(account, limit=self.entity_cache_warmup_limit())
                 else:
                     self.set_account_state(account, "revoked")
@@ -384,94 +370,6 @@ class ApiState:
                 delay = min(delay * 2, max_delay)
                 continue
             await asyncio.sleep(delay)
-
-    async def _desktop_sync_loop(self, account: str) -> None:
-        next_ping = 0.0
-        next_state = 0.0
-        next_difference = 0.0
-        next_dialogs = 0.0
-        while True:
-            service = self.settings().service
-            try:
-                layer = await self.require_layer(account)
-                if not await layer.is_authorized():
-                    self.set_account_state(account, "revoked")
-                    await asyncio.sleep(service.health_ping_interval_seconds)
-                    continue
-                client = await layer.authorized_client()
-                now = time.monotonic()
-                self.set_account_state(account, "updating")
-                if now >= next_ping:
-                    await client(functions.PingRequest(ping_id=random.getrandbits(63)))
-                    next_ping = now + random_interval(
-                        service.health_ping_interval_seconds,
-                        service.health_ping_max_interval_seconds,
-                        floor=15,
-                    )
-                if now >= next_state:
-                    state_result = await client(functions.updates.GetStateRequest())
-                    self.update_sync_state_from_object(account, state_result)
-                    next_state = now + random_interval(
-                        service.health_get_state_interval_seconds,
-                        service.health_get_state_max_interval_seconds,
-                        floor=30,
-                    )
-                if now >= next_difference:
-                    sync_state = self.sync_states.get(account)
-                    if sync_state is None:
-                        state_result = await client(functions.updates.GetStateRequest())
-                        sync_state = self.update_sync_state_from_object(account, state_result)
-                    difference = await client(
-                        functions.updates.GetDifferenceRequest(
-                            pts=sync_state.get("pts", 0),
-                            date=sync_state.get("date", 0),
-                            qts=sync_state.get("qts", 0),
-                        )
-                    )
-                    self.apply_difference(account, difference)
-                    next_difference = now + random_interval(
-                        service.health_get_difference_interval_seconds,
-                        service.health_get_difference_max_interval_seconds,
-                        floor=60,
-                    )
-                if now >= next_dialogs:
-                    if service.entity_cache_warmup_dialogs > 0:
-                        await self.warm_entity_cache(
-                            account,
-                            limit=self.entity_cache_warmup_limit(),
-                        )
-                    next_dialogs = now + random_interval(
-                        service.health_dialog_refresh_interval_seconds,
-                        service.health_dialog_refresh_max_interval_seconds,
-                        floor=60,
-                    )
-                self.connection_health.setdefault(account, {})
-                self.connection_health[account].update(
-                    {
-                        "account": account,
-                        "ok": True,
-                        "desktop_sync": True,
-                        "last_sync_ts": int(time.time()),
-                    }
-                )
-                self.set_account_state(account, "authorized")
-                next_deadline = min(next_ping, next_state, next_difference, next_dialogs)
-                await asyncio.sleep(max(0.1, min(5.0, next_deadline - time.monotonic())))
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self.connection_health.setdefault(account, {})
-                self.connection_health[account].update(
-                    {
-                        "account": account,
-                        "ok": False,
-                        "desktop_sync": True,
-                        "error": str(exc),
-                        "last_sync_error_ts": int(time.time()),
-                    }
-                )
-                self.set_account_state(account, "disconnected")
-                await asyncio.sleep(random.uniform(5, 15))
 
     async def start_passive_update_receiver(self, account: str) -> None:
         account_name = self.resolve_account(account)
@@ -563,19 +461,77 @@ class ApiState:
             )
         return result
 
-    async def mark_user_activity(self, account: str | None = None) -> None:
+    async def mark_user_activity(self, account: str | None = None, *, send_online: bool = False) -> None:
         account_name = self.resolve_account(account)
+        now = time.monotonic()
+        previous_activity = self.last_user_activity_at.get(account_name)
+        self.last_user_activity_at[account_name] = now
+        self.schedule_idle_offline(account_name)
+        if not send_online:
+            return
         layer = await self.require_layer(account_name)
         if not await layer.is_authorized():
             return
+        allowed_at = self.next_online_allowed_at.get(account_name, 0.0)
+        long_pause = previous_activity is None or now - previous_activity > 300
+        if not long_pause and now < allowed_at:
+            return
         client = await layer.authorized_client()
         await client(functions.account.UpdateStatusRequest(offline=False))
+        self.last_online_status_at[account_name] = now
+        self.next_online_allowed_at[account_name] = now + random.uniform(30, 60)
         self.online_status[account_name] = {
             "account": account_name,
             "keep_online": False,
             "activity_online": True,
             "last_update_ts": int(time.time()),
         }
+
+    def schedule_idle_offline(self, account: str) -> None:
+        account_name = self.resolve_account(account)
+        task = self.idle_offline_tasks.pop(account_name, None)
+        if task:
+            task.cancel()
+        self.idle_offline_tasks[account_name] = asyncio.create_task(self._idle_offline_after(account_name))
+
+    async def stop_idle_offline_timer(self, account: str) -> None:
+        account_name = self.resolve_account(account)
+        task = self.idle_offline_tasks.pop(account_name, None)
+        if task:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+    async def _idle_offline_after(self, account: str) -> None:
+        idle_seconds = random.uniform(120, 300)
+        try:
+            await asyncio.sleep(idle_seconds)
+            last_activity = self.last_user_activity_at.get(account, 0.0)
+            if time.monotonic() - last_activity < idle_seconds:
+                return
+            layer = self.layers.get(account)
+            if not layer or not await layer.is_authorized():
+                return
+            client = await layer.authorized_client()
+            await client(functions.account.UpdateStatusRequest(offline=True))
+            self.online_status[account] = {
+                "account": account,
+                "keep_online": False,
+                "activity_online": False,
+                "idle_offline": True,
+                "last_update_ts": int(time.time()),
+                "idle_seconds": round(idle_seconds, 2),
+            }
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.online_status[account] = {
+                "account": account,
+                "keep_online": False,
+                "activity_online": False,
+                "idle_offline_error": str(exc),
+                "last_update_ts": int(time.time()),
+            }
 
     def load_sync_states(self) -> None:
         path = self.state_db_path()
@@ -585,14 +541,19 @@ class ApiState:
             with self.open_state_db() as connection:
                 rows = connection.execute("select account, pts, date, qts from sync_state").fetchall()
         except sqlite3.Error:
-            self.backup_corrupt_state_db()
             return
         self.sync_states = {
             normalize_account_name(account): {"pts": int(pts), "date": int(date), "qts": int(qts)}
             for account, pts, date, qts in rows
         }
 
-    def update_sync_state_from_object(self, account: str, value: Any) -> dict[str, int]:
+    def update_sync_state_from_object(
+        self,
+        account: str,
+        value: Any,
+        *,
+        persist: bool = True,
+    ) -> dict[str, int]:
         current = self.sync_states.get(account, {"pts": 0, "date": 0, "qts": 0})
         state = {
             "pts": int(getattr(value, "pts", current["pts"]) or current["pts"]),
@@ -600,50 +561,66 @@ class ApiState:
             "qts": int(getattr(value, "qts", current["qts"]) or current["qts"]),
         }
         self.sync_states[account] = state
-        self.save_sync_state(account, state)
+        if persist:
+            self.save_sync_state(account, state)
         return state
 
     def save_sync_state(self, account: str, state: dict[str, int]) -> None:
         path = self.state_db_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         with self.open_state_db() as connection:
-            connection.execute(
-                """
-                insert into sync_state(account, pts, date, qts, updated_ts)
-                values(?, ?, ?, ?, ?)
-                on conflict(account) do update set
-                    pts = excluded.pts,
-                    date = excluded.date,
-                    qts = excluded.qts,
-                    updated_ts = excluded.updated_ts
-                """,
-                (account, state["pts"], state["date"], state["qts"], int(time.time())),
-            )
+            self.persist_sync_state(account, state, connection)
+
+    def persist_sync_state(
+        self,
+        account: str,
+        state: dict[str, int],
+        connection: sqlite3.Connection,
+    ) -> None:
+        connection.execute(
+            """
+            insert into sync_state(account, pts, date, qts, updated_ts)
+            values(?, ?, ?, ?, ?)
+            on conflict(account) do update set
+                pts = excluded.pts,
+                date = excluded.date,
+                qts = excluded.qts,
+                updated_ts = excluded.updated_ts
+            """,
+            (account, state["pts"], state["date"], state["qts"], int(time.time())),
+        )
 
     def apply_difference(self, account: str, difference: Any) -> None:
-        self.persist_update_bundle(account, "difference", difference)
-        state = getattr(difference, "state", None) or getattr(difference, "intermediate_state", None)
-        if state is not None:
-            self.update_sync_state_from_object(account, state)
-        for user in getattr(difference, "users", []) or []:
-            self.persist_entity(account, user)
-        for chat in getattr(difference, "chats", []) or []:
-            self.persist_entity(account, chat)
-        for message in getattr(difference, "new_messages", []) or []:
-            self.persist_message(account, message)
-        for message in getattr(difference, "new_encrypted_messages", []) or []:
-            self.persist_message(account, message)
-        for update in getattr(difference, "other_updates", []) or []:
-            self.apply_update_object(account, update)
-        for update in getattr(difference, "updates", []) or []:
-            self.apply_update_object(account, update)
+        with self.open_state_db() as connection:
+            self.persist_update_bundle(account, "difference", difference, connection)
+            state = getattr(difference, "state", None) or getattr(difference, "intermediate_state", None)
+            if state is not None:
+                current = self.update_sync_state_from_object(account, state, persist=False)
+                self.persist_sync_state(account, current, connection)
+            for user in getattr(difference, "users", []) or []:
+                self.persist_entity(account, user, connection)
+            for chat in getattr(difference, "chats", []) or []:
+                self.persist_entity(account, chat, connection)
+            for message in getattr(difference, "new_messages", []) or []:
+                self.persist_message(account, message, connection)
+            for message in getattr(difference, "new_encrypted_messages", []) or []:
+                self.persist_message(account, message, connection)
+            for update in getattr(difference, "other_updates", []) or []:
+                self.apply_update_object(account, update, connection)
+            for update in getattr(difference, "updates", []) or []:
+                self.apply_update_object(account, update, connection)
 
     def apply_raw_update(self, account: str, event: Any) -> None:
         update = getattr(event, "original_update", event)
         self.apply_update_object(account, update)
 
-    def apply_update_object(self, account: str, update: Any) -> None:
-        self.persist_update_bundle(account, type(update).__name__, update)
+    def apply_update_object(
+        self,
+        account: str,
+        update: Any,
+        connection: sqlite3.Connection | None = None,
+    ) -> None:
+        self.persist_update_bundle(account, type(update).__name__, update, connection)
         pts = getattr(update, "pts", None)
         if pts is not None:
             current = self.sync_states.get(account, {"pts": 0, "date": 0, "qts": 0})
@@ -655,21 +632,39 @@ class ApiState:
             if qts is not None:
                 current["qts"] = max(int(current.get("qts", 0)), int(qts))
             self.sync_states[account] = current
-            self.save_sync_state(account, current)
+            if connection is not None:
+                self.persist_sync_state(account, current, connection)
+            else:
+                self.save_sync_state(account, current)
         message = getattr(update, "message", None)
         if message is not None:
-            self.persist_message(account, message)
+            self.persist_message(account, message, connection)
         user = getattr(update, "user", None)
         if user is not None:
-            self.persist_entity(account, user)
+            self.persist_entity(account, user, connection)
         chat = getattr(update, "chat", None)
         if chat is not None:
-            self.persist_entity(account, chat)
+            self.persist_entity(account, chat, connection)
         if "Read" in type(update).__name__:
-            self.persist_read_state(account, update)
+            self.persist_read_state(account, update, connection)
 
-    def persist_update_bundle(self, account: str, kind: str, value: Any) -> None:
+    def persist_update_bundle(
+        self,
+        account: str,
+        kind: str,
+        value: Any,
+        connection: sqlite3.Connection | None = None,
+    ) -> None:
         payload = serialize_tl(value)
+        if connection is not None:
+            connection.execute(
+                """
+                insert into raw_updates(account, kind, payload_json, created_ts)
+                values(?, ?, ?, ?)
+                """,
+                (account, kind, safe_json_dumps(payload), int(time.time())),
+            )
+            return
         with self.open_state_db() as connection:
             connection.execute(
                 """
@@ -679,22 +674,30 @@ class ApiState:
                 (account, kind, safe_json_dumps(payload), int(time.time())),
             )
 
-    def persist_message(self, account: str, message: Any) -> None:
+    def persist_message(
+        self,
+        account: str,
+        message: Any,
+        connection: sqlite3.Connection | None = None,
+    ) -> None:
         message_id = getattr(message, "id", None)
         peer_id = getattr(message, "peer_id", None) or getattr(message, "chat_id", None)
         peer_key = str(serialize_tl(peer_id)) if peer_id is not None else ""
         payload = serialize_tl(message)
-        with self.open_state_db() as connection:
-            connection.execute(
-                """
-                insert into messages(account, peer_key, message_id, payload_json, updated_ts)
-                values(?, ?, ?, ?, ?)
-                on conflict(account, peer_key, message_id) do update set
-                    payload_json = excluded.payload_json,
-                    updated_ts = excluded.updated_ts
-                """,
-                (account, peer_key, int(message_id or 0), safe_json_dumps(payload), int(time.time())),
-            )
+        if connection is None:
+            with self.open_state_db() as connection:
+                self.persist_message(account, message, connection)
+            return
+        connection.execute(
+            """
+            insert into messages(account, peer_key, message_id, payload_json, updated_ts)
+            values(?, ?, ?, ?, ?)
+            on conflict(account, peer_key, message_id) do update set
+                payload_json = excluded.payload_json,
+                updated_ts = excluded.updated_ts
+            """,
+            (account, peer_key, int(message_id or 0), safe_json_dumps(payload), int(time.time())),
+        )
 
     def persist_dialog(self, account: str, dialog: dict[str, Any]) -> None:
         dialog_id = str(dialog.get("id") or "")
@@ -712,7 +715,12 @@ class ApiState:
                 (account, dialog_id, safe_json_dumps(dialog), int(time.time())),
             )
 
-    def persist_entity(self, account: str, entity: Any) -> None:
+    def persist_entity(
+        self,
+        account: str,
+        entity: Any,
+        connection: sqlite3.Connection | None = None,
+    ) -> None:
         entity_id = getattr(entity, "id", None)
         if entity_id is None:
             return
@@ -723,42 +731,53 @@ class ApiState:
         if username:
             self.entity_cache[account][f"@{username}".lower()] = payload
             self.entity_cache[account][str(username).lower()] = payload
-        with self.open_state_db() as connection:
-            connection.execute(
-                """
-                insert into entities(account, entity_id, kind, payload_json, updated_ts)
-                values(?, ?, ?, ?, ?)
-                on conflict(account, entity_id) do update set
-                    kind = excluded.kind,
-                    payload_json = excluded.payload_json,
-                    updated_ts = excluded.updated_ts
-                """,
-                (
-                    account,
-                    entity_key,
-                    type(entity).__name__,
-                    safe_json_dumps(payload),
-                    int(time.time()),
-                ),
-            )
+        if connection is None:
+            with self.open_state_db() as connection:
+                self.persist_entity(account, entity, connection)
+            return
+        connection.execute(
+            """
+            insert into entities(account, entity_id, kind, payload_json, updated_ts)
+            values(?, ?, ?, ?, ?)
+            on conflict(account, entity_id) do update set
+                kind = excluded.kind,
+                payload_json = excluded.payload_json,
+                updated_ts = excluded.updated_ts
+            """,
+            (
+                account,
+                entity_key,
+                type(entity).__name__,
+                safe_json_dumps(payload),
+                int(time.time()),
+            ),
+        )
 
-    def persist_read_state(self, account: str, update: Any) -> None:
+    def persist_read_state(
+        self,
+        account: str,
+        update: Any,
+        connection: sqlite3.Connection | None = None,
+    ) -> None:
         peer = getattr(update, "peer", None) or getattr(update, "channel_id", None) or ""
         peer_key = str(serialize_tl(peer))
         max_id = int(getattr(update, "max_id", 0) or 0)
         payload = serialize_tl(update)
-        with self.open_state_db() as connection:
-            connection.execute(
-                """
-                insert into read_state(account, peer_key, max_id, payload_json, updated_ts)
-                values(?, ?, ?, ?, ?)
-                on conflict(account, peer_key) do update set
-                    max_id = max(read_state.max_id, excluded.max_id),
-                    payload_json = excluded.payload_json,
-                    updated_ts = excluded.updated_ts
-                """,
-                (account, peer_key, max_id, safe_json_dumps(payload), int(time.time())),
-            )
+        if connection is None:
+            with self.open_state_db() as connection:
+                self.persist_read_state(account, update, connection)
+            return
+        connection.execute(
+            """
+            insert into read_state(account, peer_key, max_id, payload_json, updated_ts)
+            values(?, ?, ?, ?, ?)
+            on conflict(account, peer_key) do update set
+                max_id = max(read_state.max_id, excluded.max_id),
+                payload_json = excluded.payload_json,
+                updated_ts = excluded.updated_ts
+            """,
+            (account, peer_key, max_id, safe_json_dumps(payload), int(time.time())),
+        )
 
     def persist_read_command(self, account: str, entity: Any, max_id: int, result: Any) -> None:
         payload = {"entity": serialize_tl(entity), "result": serialize_tl(result)}
@@ -789,7 +808,6 @@ class ApiState:
             with self.open_state_db() as connection:
                 rows = connection.execute("select account, cache_json from entity_cache").fetchall()
         except sqlite3.Error:
-            self.backup_corrupt_state_db()
             return
         cache: dict[str, dict[str, dict[str, Any]]] = {}
         for account, cache_json in rows:
@@ -823,28 +841,27 @@ class ApiState:
     def open_state_db(self) -> sqlite3.Connection:
         path = self.state_db_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        connection: sqlite3.Connection | None = None
-        try:
-            connection = sqlite3.connect(path)
-            self.ensure_state_schema(connection)
-            return connection
-        except sqlite3.Error:
-            if connection is not None:
-                connection.close()
-            self.backup_corrupt_state_db()
-            connection = sqlite3.connect(path)
-            self.ensure_state_schema(connection)
-            return connection
+        if self._state_db is None:
+            self._state_db = sqlite3.connect(path)
+            self._state_db.execute("pragma journal_mode=wal")
+            self._state_db.execute("pragma busy_timeout=5000")
+            self.ensure_state_schema(self._state_db)
+        return self._state_db
 
-    def backup_corrupt_state_db(self) -> None:
-        path = self.state_db_path()
-        if not path.exists():
+    def close_state_db(self) -> None:
+        if self._state_db is None:
             return
-        backup = path.with_suffix(path.suffix + f".corrupt.{int(time.time())}")
-        try:
-            path.replace(backup)
-        except OSError:
-            pass
+        self._state_db.close()
+        self._state_db = None
+
+    def prune_state_retention(self) -> None:
+        service = self.settings().service
+        now = int(time.time())
+        raw_cutoff = now - max(1, service.raw_updates_retention_days) * 86400
+        flood_cutoff = now - max(1, service.flood_errors_retention_days) * 86400
+        with self.open_state_db() as connection:
+            connection.execute("delete from raw_updates where created_ts < ?", (raw_cutoff,))
+            connection.execute("delete from flood_errors where created_ts < ?", (flood_cutoff,))
 
     @staticmethod
     def ensure_state_schema(connection: sqlite3.Connection) -> None:
@@ -1043,7 +1060,7 @@ class AccountPayload(BaseModel):
 
 class AccountConnectPayload(BaseModel):
     account: str | None = None
-    keep_online: bool = True
+    keep_online: bool = False
 
 
 class ClientProfilePayload(BaseModel):
@@ -1088,6 +1105,10 @@ class ServiceSettingsPayload(BaseModel):
     telegram_requests_per_second: int = Field(default=10, ge=1)
     telegram_requests_per_minute: int = Field(default=50, ge=1)
     telegram_requests_per_hour: int = Field(default=500, ge=1)
+    telegram_read_requests_per_second: int = Field(default=5, ge=1)
+    telegram_send_requests_per_second: int = Field(default=2, ge=1)
+    telegram_typing_requests_per_second: int = Field(default=1, ge=1)
+    telegram_sync_requests_per_minute: int = Field(default=2, ge=1)
     max_dialog_limit: int = Field(default=100, ge=1)
     max_message_limit: int = Field(default=100, ge=1)
     blocked_account_names: list[str] = Field(default_factory=lambda: ["string", "account"])
@@ -1105,20 +1126,13 @@ class ServiceSettingsPayload(BaseModel):
     reconnect_min_delay_seconds: int = Field(default=5, ge=1)
     reconnect_max_delay_seconds: int = Field(default=120, ge=1)
     passive_update_receiver: bool = True
-    desktop_sync_enabled: bool = False
     entity_cache_warmup_dialogs: int = Field(default=50, ge=0)
     entity_cache_warmup_min_dialogs: int = Field(default=40, ge=0)
     entity_cache_warmup_max_dialogs: int = Field(default=60, ge=0)
-    health_ping_interval_seconds: int = Field(default=300, ge=15)
-    health_ping_max_interval_seconds: int = Field(default=600, ge=15)
-    health_get_state_interval_seconds: int = Field(default=180, ge=30)
-    health_get_state_max_interval_seconds: int = Field(default=300, ge=30)
-    health_get_difference_interval_seconds: int = Field(default=300, ge=60)
-    health_get_difference_max_interval_seconds: int = Field(default=600, ge=60)
-    health_dialog_refresh_interval_seconds: int = Field(default=3600, ge=60)
-    health_dialog_refresh_max_interval_seconds: int = Field(default=7200, ge=60)
     require_connection_health_before_auth: bool = True
     connection_health_timeout_seconds: int = Field(default=20, ge=1)
+    raw_updates_retention_days: int = Field(default=7, ge=1)
+    flood_errors_retention_days: int = Field(default=30, ge=1)
 
 
 class SendCodePayload(BaseModel):
@@ -1610,6 +1624,7 @@ def create_app(state: ApiState) -> FastAPI:
         return {
             "proxy_url": mask_url_secret(settings.proxy_url),
             "client_profile": settings.client_profile.to_dict(),
+            "desktop_user_agent": OFFICIAL_DESKTOP_USER_AGENT,
             "service": settings.service.to_dict(),
             "active_account": settings.active_account,
             "accounts": settings.accounts,
@@ -1651,13 +1666,13 @@ def create_app(state: ApiState) -> FastAPI:
         account_name = state.resolve_account(payload.account)
         layer = await state.require_layer(account_name)
         authorized = await layer.is_authorized()
-        if payload.keep_online and authorized:
+        if authorized:
             await state.activate_desktop_like_runtime(account_name)
         return {
             "account": account_name,
             "connected": True,
             "authorized": authorized,
-            "keep_online": payload.keep_online and authorized,
+            "keep_online": state.settings().service.keep_accounts_online and authorized,
             "online_status": state.online_status.get(account_name),
         }
 
@@ -1681,8 +1696,8 @@ def create_app(state: ApiState) -> FastAPI:
                 account for account, task in state.reconnect_tasks.items() if not task.done()
             ),
             "passive_receivers": sorted(state.update_handlers),
-            "desktop_sync_tasks": sorted(
-                account for account, task in state.health_tasks.items() if not task.done()
+            "idle_offline_tasks": sorted(
+                account for account, task in state.idle_offline_tasks.items() if not task.done()
             ),
             "queue_worker": state.queue_worker_status,
         }
@@ -1840,6 +1855,7 @@ def create_app(state: ApiState) -> FastAPI:
         except SessionPasswordNeededError:
             return {"status": "password_required"}
         await state.activate_desktop_like_runtime(state.resolve_account(account))
+        await state.mark_user_activity(account, send_online=True)
         return {"status": "authorized"}
 
     @app.post("/auth/password")
@@ -1851,6 +1867,7 @@ def create_app(state: ApiState) -> FastAPI:
         except PasswordHashInvalidError as exc:
             raise HTTPException(status_code=400, detail="Invalid two-step password") from exc
         await state.activate_desktop_like_runtime(state.resolve_account(account))
+        await state.mark_user_activity(account, send_online=True)
         return {"status": "authorized"}
 
     @app.get("/me")
@@ -1908,7 +1925,7 @@ def create_app(state: ApiState) -> FastAPI:
         account: str | None = None,
     ) -> dict[str, Any]:
         ensure_telegram_rate(state, account, "messages.send")
-        await state.mark_user_activity(account)
+        await state.mark_user_activity(account, send_online=True)
         idempotency_key = make_action_idempotency_key(
             state.resolve_account(account),
             "messages.send",
@@ -1989,7 +2006,7 @@ def create_app(state: ApiState) -> FastAPI:
         account: str | None = None,
     ) -> dict[str, Any]:
         ensure_telegram_rate(state, account, "messages.send")
-        await state.mark_user_activity(account)
+        await state.mark_user_activity(account, send_online=True)
         idempotency_key = make_action_idempotency_key(
             state.resolve_account(account),
             "messages.send_username",
@@ -2086,6 +2103,7 @@ def create_app(state: ApiState) -> FastAPI:
         account: str | None = None,
     ) -> dict[str, Any]:
         ensure_telegram_rate(state, account, "media.send")
+        await state.mark_user_activity(account, send_online=True)
         client = await require_authorized_client(state, account)
         file_value, cleanup = decode_upload_file(payload.file_path, payload.file_base64, payload.file_name)
         try:
@@ -2695,6 +2713,24 @@ def ensure_telegram_rate(state: ApiState, account: str | None, action: str) -> N
                 headers={"Retry-After": str(retry_after)},
             )
     key = f"{account_name}:{action}"
+    type_limit = telegram_action_type_limit(service, action)
+    if type_limit is not None:
+        type_name, type_limit_value, type_window_seconds = type_limit
+        type_key = f"{account_name}:type:{type_name}:{telegram_action_rate_key(action)}"
+        if not check_bucket(
+            state.telegram_rate_limits,
+            type_key,
+            type_limit_value,
+            window_seconds=type_window_seconds,
+        ):
+            raise HTTPException(
+                status_code=429,
+                detail=(
+                    "Telegram typed action rate limit exceeded. "
+                    f"Limit: {type_limit_value}/{type_window_seconds}s for {type_name}."
+                ),
+                headers={"Retry-After": str(type_window_seconds)},
+            )
     action_limit, window_seconds = telegram_action_limit(service, action)
     if not check_bucket(
         state.telegram_rate_limits,
@@ -2777,6 +2813,24 @@ def telegram_action_limit(service: ServiceSettings, action: str) -> tuple[int, i
     return service.telegram_actions_per_minute, 60
 
 
+def telegram_action_type_limit(service: ServiceSettings, action: str) -> tuple[str, int, int] | None:
+    if action.startswith("messages.read"):
+        return "read", service.telegram_read_requests_per_second, 1
+    if action.startswith(("messages.send", "media.send", "bot.send")):
+        return "send", service.telegram_send_requests_per_second, 1
+    if action.startswith("messages.typing"):
+        return "typing", service.telegram_typing_requests_per_second, 1
+    if action.startswith(("updates.", "accounts.sync")):
+        return "sync", service.telegram_sync_requests_per_minute, 60
+    return None
+
+
+def telegram_action_rate_key(action: str) -> str:
+    if action.startswith("messages.typing"):
+        return action
+    return "all"
+
+
 def telegram_limit_summary(service: ServiceSettings) -> dict[str, Any]:
     return {
         "telegram_actions_per_minute": service.telegram_actions_per_minute,
@@ -2790,6 +2844,10 @@ def telegram_limit_summary(service: ServiceSettings) -> dict[str, Any]:
         "telegram_requests_per_second": service.telegram_requests_per_second,
         "telegram_requests_per_minute": service.telegram_requests_per_minute,
         "telegram_requests_per_hour": service.telegram_requests_per_hour,
+        "telegram_read_requests_per_second": service.telegram_read_requests_per_second,
+        "telegram_send_requests_per_second": service.telegram_send_requests_per_second,
+        "telegram_typing_requests_per_second": service.telegram_typing_requests_per_second,
+        "telegram_sync_requests_per_minute": service.telegram_sync_requests_per_minute,
         "telegram_min_action_interval_seconds": service.telegram_min_action_interval_seconds,
         "telegram_default_flood_cooldown_seconds": service.telegram_default_flood_cooldown_seconds,
     }
