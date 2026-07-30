@@ -227,7 +227,8 @@ class ApiState:
             await self.warm_entity_cache(account_name, limit=self.entity_cache_warmup_limit())
         if service.reconnect_enabled:
             self.start_reconnect_loop(account_name)
-        self.start_desktop_sync_loop(account_name)
+        if service.desktop_sync_enabled:
+            self.start_desktop_sync_loop(account_name)
 
     async def stop_online_keepalive(self, account: str) -> None:
         account_name = self.resolve_account(account)
@@ -339,11 +340,11 @@ class ApiState:
                 pass
 
     async def _reconnect_loop(self, account: str) -> None:
+        delay = self.settings().service.reconnect_min_delay_seconds
         while True:
             service = self.settings().service
             min_delay = max(1, service.reconnect_min_delay_seconds)
             max_delay = max(min_delay, service.reconnect_max_delay_seconds)
-            delay = random.uniform(min_delay, max_delay)
             try:
                 layer = await self.require_layer(account)
                 client = await layer.authorized_client()
@@ -380,6 +381,7 @@ class ApiState:
                 }
                 self.set_account_state(account, "disconnected")
                 await asyncio.sleep(delay)
+                delay = min(delay * 2, max_delay)
                 continue
             await asyncio.sleep(delay)
 
@@ -560,6 +562,20 @@ class ApiState:
                 },
             )
         return result
+
+    async def mark_user_activity(self, account: str | None = None) -> None:
+        account_name = self.resolve_account(account)
+        layer = await self.require_layer(account_name)
+        if not await layer.is_authorized():
+            return
+        client = await layer.authorized_client()
+        await client(functions.account.UpdateStatusRequest(offline=False))
+        self.online_status[account_name] = {
+            "account": account_name,
+            "keep_online": False,
+            "activity_online": True,
+            "last_update_ts": int(time.time()),
+        }
 
     def load_sync_states(self) -> None:
         path = self.state_db_path()
@@ -1069,9 +1085,9 @@ class ServiceSettingsPayload(BaseModel):
     telegram_media_downloads_per_minute: int = Field(default=30, ge=1)
     telegram_media_download_concurrency: int = Field(default=2, ge=1, le=4)
     telegram_auth_requests_per_hour: int = Field(default=3, ge=1)
-    telegram_requests_per_second: int = Field(default=50, ge=1)
-    telegram_requests_per_minute: int = Field(default=200, ge=1)
-    telegram_requests_per_hour: int = Field(default=2000, ge=1)
+    telegram_requests_per_second: int = Field(default=10, ge=1)
+    telegram_requests_per_minute: int = Field(default=50, ge=1)
+    telegram_requests_per_hour: int = Field(default=500, ge=1)
     max_dialog_limit: int = Field(default=100, ge=1)
     max_message_limit: int = Field(default=100, ge=1)
     blocked_account_names: list[str] = Field(default_factory=lambda: ["string", "account"])
@@ -1080,26 +1096,27 @@ class ServiceSettingsPayload(BaseModel):
     queue_visibility_timeout_seconds: int = Field(default=300, ge=1)
     queue_default_max_attempts: int = Field(default=3, ge=1)
     queue_execute_in_api: bool = True
-    keep_accounts_online: bool = True
-    online_update_interval_seconds: int = Field(default=25, ge=15)
-    online_update_min_interval_seconds: int = Field(default=25, ge=15)
-    online_update_max_interval_seconds: int = Field(default=50, ge=15)
+    keep_accounts_online: bool = False
+    online_update_interval_seconds: int = Field(default=300, ge=15)
+    online_update_min_interval_seconds: int = Field(default=300, ge=15)
+    online_update_max_interval_seconds: int = Field(default=900, ge=15)
     auto_connect_accounts: list[str] = Field(default_factory=list)
     reconnect_enabled: bool = True
-    reconnect_min_delay_seconds: int = Field(default=1, ge=1)
-    reconnect_max_delay_seconds: int = Field(default=3, ge=1)
+    reconnect_min_delay_seconds: int = Field(default=5, ge=1)
+    reconnect_max_delay_seconds: int = Field(default=120, ge=1)
     passive_update_receiver: bool = True
+    desktop_sync_enabled: bool = False
     entity_cache_warmup_dialogs: int = Field(default=50, ge=0)
     entity_cache_warmup_min_dialogs: int = Field(default=40, ge=0)
     entity_cache_warmup_max_dialogs: int = Field(default=60, ge=0)
-    health_ping_interval_seconds: int = Field(default=20, ge=15)
-    health_ping_max_interval_seconds: int = Field(default=30, ge=15)
-    health_get_state_interval_seconds: int = Field(default=45, ge=30)
-    health_get_state_max_interval_seconds: int = Field(default=60, ge=30)
-    health_get_difference_interval_seconds: int = Field(default=90, ge=60)
-    health_get_difference_max_interval_seconds: int = Field(default=120, ge=60)
-    health_dialog_refresh_interval_seconds: int = Field(default=180, ge=60)
-    health_dialog_refresh_max_interval_seconds: int = Field(default=240, ge=60)
+    health_ping_interval_seconds: int = Field(default=300, ge=15)
+    health_ping_max_interval_seconds: int = Field(default=600, ge=15)
+    health_get_state_interval_seconds: int = Field(default=180, ge=30)
+    health_get_state_max_interval_seconds: int = Field(default=300, ge=30)
+    health_get_difference_interval_seconds: int = Field(default=300, ge=60)
+    health_get_difference_max_interval_seconds: int = Field(default=600, ge=60)
+    health_dialog_refresh_interval_seconds: int = Field(default=3600, ge=60)
+    health_dialog_refresh_max_interval_seconds: int = Field(default=7200, ge=60)
     require_connection_health_before_auth: bool = True
     connection_health_timeout_seconds: int = Field(default=20, ge=1)
 
@@ -1891,6 +1908,7 @@ def create_app(state: ApiState) -> FastAPI:
         account: str | None = None,
     ) -> dict[str, Any]:
         ensure_telegram_rate(state, account, "messages.send")
+        await state.mark_user_activity(account)
         idempotency_key = make_action_idempotency_key(
             state.resolve_account(account),
             "messages.send",
@@ -1917,6 +1935,7 @@ def create_app(state: ApiState) -> FastAPI:
         account: str | None = None,
     ) -> dict[str, Any]:
         ensure_telegram_rate(state, account, "messages.typing")
+        await state.mark_user_activity(account)
         client = await require_authorized_client(state, account)
         peer = await resolve_entity(payload.entity, client=client)
         result = await client(
@@ -1933,6 +1952,7 @@ def create_app(state: ApiState) -> FastAPI:
         account: str | None = None,
     ) -> dict[str, Any]:
         ensure_telegram_rate(state, account, "messages.read")
+        await state.mark_user_activity(account)
         client = await require_authorized_client(state, account)
         peer = await resolve_entity(payload.entity, client=client)
         result = await client(
@@ -1950,6 +1970,7 @@ def create_app(state: ApiState) -> FastAPI:
         account: str | None = None,
     ) -> dict[str, Any]:
         ensure_telegram_rate(state, account, "drafts.save")
+        await state.mark_user_activity(account)
         client = await require_authorized_client(state, account)
         peer = await resolve_entity(payload.entity, client=client)
         result = await client(
@@ -1968,6 +1989,7 @@ def create_app(state: ApiState) -> FastAPI:
         account: str | None = None,
     ) -> dict[str, Any]:
         ensure_telegram_rate(state, account, "messages.send")
+        await state.mark_user_activity(account)
         idempotency_key = make_action_idempotency_key(
             state.resolve_account(account),
             "messages.send_username",

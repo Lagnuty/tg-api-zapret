@@ -166,9 +166,9 @@ class ServiceSettings:
     telegram_media_downloads_per_minute: int = 30
     telegram_media_download_concurrency: int = 2
     telegram_auth_requests_per_hour: int = 3
-    telegram_requests_per_second: int = 50
-    telegram_requests_per_minute: int = 200
-    telegram_requests_per_hour: int = 2000
+    telegram_requests_per_second: int = 10
+    telegram_requests_per_minute: int = 50
+    telegram_requests_per_hour: int = 500
     max_dialog_limit: int = 100
     max_message_limit: int = 100
     blocked_account_names: list[str] = field(default_factory=lambda: ["string", "account"])
@@ -177,26 +177,27 @@ class ServiceSettings:
     queue_visibility_timeout_seconds: int = 300
     queue_default_max_attempts: int = 3
     queue_execute_in_api: bool = True
-    keep_accounts_online: bool = True
-    online_update_interval_seconds: int = 25
-    online_update_min_interval_seconds: int = 25
-    online_update_max_interval_seconds: int = 50
+    keep_accounts_online: bool = False
+    online_update_interval_seconds: int = 300
+    online_update_min_interval_seconds: int = 300
+    online_update_max_interval_seconds: int = 900
     auto_connect_accounts: list[str] = field(default_factory=list)
     reconnect_enabled: bool = True
-    reconnect_min_delay_seconds: int = 1
-    reconnect_max_delay_seconds: int = 3
+    reconnect_min_delay_seconds: int = 5
+    reconnect_max_delay_seconds: int = 120
     passive_update_receiver: bool = True
+    desktop_sync_enabled: bool = False
     entity_cache_warmup_dialogs: int = 50
     entity_cache_warmup_min_dialogs: int = 40
     entity_cache_warmup_max_dialogs: int = 60
-    health_ping_interval_seconds: int = 20
-    health_ping_max_interval_seconds: int = 30
-    health_get_state_interval_seconds: int = 45
-    health_get_state_max_interval_seconds: int = 60
-    health_get_difference_interval_seconds: int = 90
-    health_get_difference_max_interval_seconds: int = 120
-    health_dialog_refresh_interval_seconds: int = 180
-    health_dialog_refresh_max_interval_seconds: int = 240
+    health_ping_interval_seconds: int = 300
+    health_ping_max_interval_seconds: int = 600
+    health_get_state_interval_seconds: int = 180
+    health_get_state_max_interval_seconds: int = 300
+    health_get_difference_interval_seconds: int = 300
+    health_get_difference_max_interval_seconds: int = 600
+    health_dialog_refresh_interval_seconds: int = 3600
+    health_dialog_refresh_max_interval_seconds: int = 7200
     require_connection_health_before_auth: bool = True
     connection_health_timeout_seconds: int = 20
 
@@ -334,6 +335,7 @@ class ServiceSettings:
             passive_update_receiver=bool(
                 data.get("passive_update_receiver", cls.passive_update_receiver)
             ),
+            desktop_sync_enabled=bool(data.get("desktop_sync_enabled", cls.desktop_sync_enabled)),
             entity_cache_warmup_dialogs=int(
                 data.get("entity_cache_warmup_dialogs", cls.entity_cache_warmup_dialogs)
             ),
@@ -449,6 +451,7 @@ class ServiceSettings:
             "reconnect_min_delay_seconds": self.reconnect_min_delay_seconds,
             "reconnect_max_delay_seconds": self.reconnect_max_delay_seconds,
             "passive_update_receiver": self.passive_update_receiver,
+            "desktop_sync_enabled": self.desktop_sync_enabled,
             "entity_cache_warmup_dialogs": self.entity_cache_warmup_dialogs,
             "entity_cache_warmup_min_dialogs": self.entity_cache_warmup_min_dialogs,
             "entity_cache_warmup_max_dialogs": self.entity_cache_warmup_max_dialogs,
