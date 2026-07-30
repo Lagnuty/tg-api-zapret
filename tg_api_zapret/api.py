@@ -490,6 +490,7 @@ class ApiState:
         for dialog in dialogs:
             serialized = serialize_dialog(dialog)
             cache[str(serialized["id"])] = serialized
+            self.persist_dialog(account_name, serialized)
             username = serialized.get("username")
             if username:
                 cache[f"@{username}".lower()] = serialized
@@ -587,7 +588,11 @@ class ApiState:
             self.persist_entity(account, chat)
         for message in getattr(difference, "new_messages", []) or []:
             self.persist_message(account, message)
+        for message in getattr(difference, "new_encrypted_messages", []) or []:
+            self.persist_message(account, message)
         for update in getattr(difference, "other_updates", []) or []:
+            self.apply_update_object(account, update)
+        for update in getattr(difference, "updates", []) or []:
             self.apply_update_object(account, update)
 
     def apply_raw_update(self, account: str, event: Any) -> None:
@@ -617,6 +622,8 @@ class ApiState:
         chat = getattr(update, "chat", None)
         if chat is not None:
             self.persist_entity(account, chat)
+        if "Read" in type(update).__name__:
+            self.persist_read_state(account, update)
 
     def persist_update_bundle(self, account: str, kind: str, value: Any) -> None:
         payload = serialize_tl(value)
@@ -644,6 +651,22 @@ class ApiState:
                     updated_ts = excluded.updated_ts
                 """,
                 (account, peer_key, int(message_id or 0), safe_json_dumps(payload), int(time.time())),
+            )
+
+    def persist_dialog(self, account: str, dialog: dict[str, Any]) -> None:
+        dialog_id = str(dialog.get("id") or "")
+        if not dialog_id:
+            return
+        with self.open_state_db() as connection:
+            connection.execute(
+                """
+                insert into dialogs(account, dialog_id, payload_json, updated_ts)
+                values(?, ?, ?, ?)
+                on conflict(account, dialog_id) do update set
+                    payload_json = excluded.payload_json,
+                    updated_ts = excluded.updated_ts
+                """,
+                (account, dialog_id, safe_json_dumps(dialog), int(time.time())),
             )
 
     def persist_entity(self, account: str, entity: Any) -> None:
@@ -674,6 +697,24 @@ class ApiState:
                     safe_json_dumps(payload),
                     int(time.time()),
                 ),
+            )
+
+    def persist_read_state(self, account: str, update: Any) -> None:
+        peer = getattr(update, "peer", None) or getattr(update, "channel_id", None) or ""
+        peer_key = str(serialize_tl(peer))
+        max_id = int(getattr(update, "max_id", 0) or 0)
+        payload = serialize_tl(update)
+        with self.open_state_db() as connection:
+            connection.execute(
+                """
+                insert into read_state(account, peer_key, max_id, payload_json, updated_ts)
+                values(?, ?, ?, ?, ?)
+                on conflict(account, peer_key) do update set
+                    max_id = max(read_state.max_id, excluded.max_id),
+                    payload_json = excluded.payload_json,
+                    updated_ts = excluded.updated_ts
+                """,
+                (account, peer_key, max_id, safe_json_dumps(payload), int(time.time())),
             )
 
     def load_entity_cache(self) -> None:
@@ -718,9 +759,18 @@ class ApiState:
     def open_state_db(self) -> sqlite3.Connection:
         path = self.state_db_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(path)
-        self.ensure_state_schema(connection)
-        return connection
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(path)
+            self.ensure_state_schema(connection)
+            return connection
+        except sqlite3.Error:
+            if connection is not None:
+                connection.close()
+            self.backup_corrupt_state_db()
+            connection = sqlite3.connect(path)
+            self.ensure_state_schema(connection)
+            return connection
 
     def backup_corrupt_state_db(self) -> None:
         path = self.state_db_path()
@@ -794,6 +844,17 @@ class ApiState:
         )
         connection.execute(
             """
+            create table if not exists dialogs(
+                account text not null,
+                dialog_id text not null,
+                payload_json text not null,
+                updated_ts integer not null,
+                primary key(account, dialog_id)
+            )
+            """
+        )
+        connection.execute(
+            """
             create table if not exists entities(
                 account text not null,
                 entity_id text not null,
@@ -801,6 +862,18 @@ class ApiState:
                 payload_json text not null,
                 updated_ts integer not null,
                 primary key(account, entity_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            create table if not exists read_state(
+                account text not null,
+                peer_key text not null,
+                max_id integer not null default 0,
+                payload_json text not null,
+                updated_ts integer not null,
+                primary key(account, peer_key)
             )
             """
         )
@@ -1232,6 +1305,8 @@ def create_app(state: ApiState) -> FastAPI:
                         "GET /accounts/risk-status",
                         "POST /accounts/entity-cache/warm",
                         "GET /accounts/entity-cache",
+                        "GET /accounts/sync-state",
+                        "POST /accounts/sync/difference",
                         "POST /messages/list",
                         "POST /messages/send",
                         "POST /messages/send-username",
@@ -1541,6 +1616,38 @@ def create_app(state: ApiState) -> FastAPI:
             "entities": entities,
         }
 
+    @app.get("/accounts/sync-state")
+    async def account_sync_state(account: str | None = None) -> dict[str, Any]:
+        account_name = state.resolve_account(account)
+        return {
+            "account": account_name,
+            "state": state.sync_states.get(account_name, {"pts": 0, "date": 0, "qts": 0}),
+            "state_db": str(state.state_db_path()),
+        }
+
+    @app.post("/accounts/sync/difference")
+    async def run_account_difference(account: str | None = None) -> dict[str, Any]:
+        ensure_telegram_rate(state, account, "updates.difference")
+        account_name = state.resolve_account(account)
+        client = await require_authorized_client(state, account_name)
+        sync_state = state.sync_states.get(account_name)
+        if sync_state is None:
+            state_result = await client(functions.updates.GetStateRequest())
+            sync_state = state.update_sync_state_from_object(account_name, state_result)
+        difference = await client(
+            functions.updates.GetDifferenceRequest(
+                pts=sync_state.get("pts", 0),
+                date=sync_state.get("date", 0),
+                qts=sync_state.get("qts", 0),
+            )
+        )
+        state.apply_difference(account_name, difference)
+        return {
+            "account": account_name,
+            "type": type(difference).__name__,
+            "state": state.sync_states.get(account_name),
+        }
+
     @app.put("/config/proxy")
     async def set_proxy(payload: ProxyPayload) -> dict[str, Any]:
         if payload.proxy_url:
@@ -1612,7 +1719,14 @@ def create_app(state: ApiState) -> FastAPI:
         ensure_telegram_rate(state, account, "dialogs")
         limit = clamp_limit(limit, state.settings().service.max_dialog_limit)
         layer = await state.require_layer(account)
-        return [serialize_dialog(dialog) for dialog in await layer.get_dialogs(limit=limit)]
+        account_name = state.resolve_account(account)
+        result = []
+        for dialog in await layer.get_dialogs(limit=limit):
+            serialized = serialize_dialog(dialog)
+            state.persist_dialog(account_name, serialized)
+            state.persist_entity(account_name, dialog.entity)
+            result.append(serialized)
+        return result
 
     @app.get("/messages/{entity}")
     async def messages(
@@ -2476,6 +2590,7 @@ def should_serialize_http_path(path: str) -> bool:
             "/rpc",
             "/actions/execute",
             "/tl/",
+            "/accounts/sync",
         )
     )
 
@@ -2675,10 +2790,14 @@ async def dispatch_rpc(state: ApiState, method: str, params: dict[str, Any]) -> 
         ensure_telegram_rate(state, account, "dialogs")
         limit = clamp_limit(int(params.get("limit", 20)), state.settings().service.max_dialog_limit)
         layer = await state.require_layer(account)
-        return [
-            serialize_dialog(dialog)
-            for dialog in await layer.get_dialogs(limit=limit)
-        ]
+        account_name = state.resolve_account(account)
+        result = []
+        for dialog in await layer.get_dialogs(limit=limit):
+            serialized = serialize_dialog(dialog)
+            state.persist_dialog(account_name, serialized)
+            state.persist_entity(account_name, dialog.entity)
+            result.append(serialized)
+        return result
     if method == "messages.send":
         ensure_telegram_rate(state, account, "messages.send")
         layer = await state.require_layer(account)

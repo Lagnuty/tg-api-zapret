@@ -81,6 +81,8 @@ def test_capabilities_show_full_rpc_methods(tmp_path, monkeypatch) -> None:
     assert data["interfaces"]["queue"]["execution_owner"] == "api_process"
     assert "POST /accounts/entity-cache/warm" in rest_endpoints
     assert "GET /accounts/entity-cache" in rest_endpoints
+    assert "GET /accounts/sync-state" in rest_endpoints
+    assert "POST /accounts/sync/difference" in rest_endpoints
     assert "POST /messages/list" in rest_endpoints
 
 
