@@ -185,6 +185,10 @@ class ServiceSettings:
     db_writer_locked_retries: int = 3
     db_writer_io_retries: int = 2
     db_writer_failed_alert_threshold: int = 10
+    db_writer_dead_letter_max_records: int = 500
+    db_writer_dead_letter_ttl_days: int = 30
+    db_writer_degraded_queue_ratio: float = 0.8
+    db_writer_drop_categories: list[str] = field(default_factory=lambda: ["diagnostics", "typing", "presence"])
     keep_accounts_online: bool = False
     online_update_interval_seconds: int = 300
     online_update_min_interval_seconds: int = 300
@@ -209,6 +213,11 @@ class ServiceSettings:
     idempotency_retention_hours: int = 48
     idempotency_max_records: int = 10000
     idempotency_lease_seconds: int = 300
+    idempotency_message_lease_seconds: int = 300
+    idempotency_media_lease_seconds: int = 3600
+    idempotency_large_file_lease_seconds: int = 7200
+    idempotency_heartbeat_min_seconds: int = 30
+    idempotency_heartbeat_max_seconds: int = 60
     idempotency_result_max_bytes: int = 1048576
     state_retention_min_interval_hours: int = 12
     state_retention_max_interval_hours: int = 24
@@ -340,6 +349,18 @@ class ServiceSettings:
             db_writer_failed_alert_threshold=int(
                 data.get("db_writer_failed_alert_threshold", cls.db_writer_failed_alert_threshold)
             ),
+            db_writer_dead_letter_max_records=int(
+                data.get("db_writer_dead_letter_max_records", cls.db_writer_dead_letter_max_records)
+            ),
+            db_writer_dead_letter_ttl_days=int(
+                data.get("db_writer_dead_letter_ttl_days", cls.db_writer_dead_letter_ttl_days)
+            ),
+            db_writer_degraded_queue_ratio=float(
+                data.get("db_writer_degraded_queue_ratio", cls.db_writer_degraded_queue_ratio)
+            ),
+            db_writer_drop_categories=list(
+                data.get("db_writer_drop_categories", defaults.db_writer_drop_categories)
+            ),
             keep_accounts_online=bool(data.get("keep_accounts_online", cls.keep_accounts_online)),
             online_update_interval_seconds=int(
                 data.get("online_update_interval_seconds", cls.online_update_interval_seconds)
@@ -421,6 +442,21 @@ class ServiceSettings:
             idempotency_lease_seconds=int(
                 data.get("idempotency_lease_seconds", cls.idempotency_lease_seconds)
             ),
+            idempotency_message_lease_seconds=int(
+                data.get("idempotency_message_lease_seconds", cls.idempotency_message_lease_seconds)
+            ),
+            idempotency_media_lease_seconds=int(
+                data.get("idempotency_media_lease_seconds", cls.idempotency_media_lease_seconds)
+            ),
+            idempotency_large_file_lease_seconds=int(
+                data.get("idempotency_large_file_lease_seconds", cls.idempotency_large_file_lease_seconds)
+            ),
+            idempotency_heartbeat_min_seconds=int(
+                data.get("idempotency_heartbeat_min_seconds", cls.idempotency_heartbeat_min_seconds)
+            ),
+            idempotency_heartbeat_max_seconds=int(
+                data.get("idempotency_heartbeat_max_seconds", cls.idempotency_heartbeat_max_seconds)
+            ),
             idempotency_result_max_bytes=int(
                 data.get("idempotency_result_max_bytes", cls.idempotency_result_max_bytes)
             ),
@@ -490,6 +526,10 @@ class ServiceSettings:
             "db_writer_locked_retries": self.db_writer_locked_retries,
             "db_writer_io_retries": self.db_writer_io_retries,
             "db_writer_failed_alert_threshold": self.db_writer_failed_alert_threshold,
+            "db_writer_dead_letter_max_records": self.db_writer_dead_letter_max_records,
+            "db_writer_dead_letter_ttl_days": self.db_writer_dead_letter_ttl_days,
+            "db_writer_degraded_queue_ratio": self.db_writer_degraded_queue_ratio,
+            "db_writer_drop_categories": self.db_writer_drop_categories,
             "keep_accounts_online": self.keep_accounts_online,
             "online_update_interval_seconds": self.online_update_interval_seconds,
             "online_update_min_interval_seconds": self.online_update_min_interval_seconds,
@@ -514,6 +554,11 @@ class ServiceSettings:
             "idempotency_retention_hours": self.idempotency_retention_hours,
             "idempotency_max_records": self.idempotency_max_records,
             "idempotency_lease_seconds": self.idempotency_lease_seconds,
+            "idempotency_message_lease_seconds": self.idempotency_message_lease_seconds,
+            "idempotency_media_lease_seconds": self.idempotency_media_lease_seconds,
+            "idempotency_large_file_lease_seconds": self.idempotency_large_file_lease_seconds,
+            "idempotency_heartbeat_min_seconds": self.idempotency_heartbeat_min_seconds,
+            "idempotency_heartbeat_max_seconds": self.idempotency_heartbeat_max_seconds,
             "idempotency_result_max_bytes": self.idempotency_result_max_bytes,
             "state_retention_min_interval_hours": self.state_retention_min_interval_hours,
             "state_retention_max_interval_hours": self.state_retention_max_interval_hours,

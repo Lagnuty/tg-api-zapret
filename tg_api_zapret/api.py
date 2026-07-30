@@ -12,6 +12,7 @@ import logging
 import os
 from pathlib import Path
 import random
+import shutil
 import sqlite3
 import tempfile
 import threading
@@ -68,6 +69,8 @@ class DBWriteJob:
     args: tuple[Any, ...]
     kwargs: dict[str, Any]
     future: asyncio.Future[Any] | None
+    category: str = "critical"
+    backpressure: str = "wait"
     id: str = field(default_factory=lambda: uuid4().hex)
     attempt: int = 0
     created_ts: int = field(default_factory=lambda: int(time.time()))
@@ -124,6 +127,7 @@ class ApiState:
         self.db_writer_shutdown_started = False
         self.db_writer_loop: asyncio.AbstractEventLoop | None = None
         self.db_writer_failed_writes = 0
+        self.db_writer_dropped_writes = 0
         self.db_writer_dead_letters: list[dict[str, Any]] = []
         self.db_writer_status: dict[str, Any] = {
             "lifecycle": "stopped",
@@ -131,6 +135,8 @@ class ApiState:
             "running": False,
             "queued": 0,
             "failed_writes": 0,
+            "dropped_writes": 0,
+            "degraded": False,
         }
         self.last_state_vacuum_at: float = 0.0
         self.queue_worker_task: asyncio.Task[None] | None = None
@@ -142,6 +148,7 @@ class ApiState:
         self.sync_states: dict[str, dict[str, int]] = {}
         self._state_db: sqlite3.Connection | None = None
         self._state_db_auto_vacuum_checked = False
+        self.state_db_maintenance_status: dict[str, Any] = {}
         self.state_db_lock = threading.RLock()
 
     async def startup(self) -> None:
@@ -232,7 +239,17 @@ class ApiState:
             self.connection_health[account] = {"account": account, "ok": True, "last_check_ts": int(time.time())}
             return True
         except Exception:
+            self.invalidate_connection_health(account)
             return False
+
+    def invalidate_connection_health(self, account: str | None = None, error: Exception | str | None = None) -> None:
+        account_name = self.resolve_account(account)
+        self.connection_health[account_name] = {
+            "account": account_name,
+            "ok": False,
+            "invalidated_ts": int(time.time()),
+            "error": str(error) if error else "connection health cache invalidated",
+        }
 
     async def disconnect(self, account: str | None = None) -> None:
         if account is None:
@@ -394,6 +411,7 @@ class ApiState:
                 "queue_maxsize": self.db_write_queue.maxsize,
             }
         )
+        self.update_db_writer_queue_status()
         self.db_writer_task = asyncio.create_task(self._db_writer_loop())
         self.db_writer_status.update(
             {
@@ -433,6 +451,21 @@ class ApiState:
             )
         self.db_writer_loop = None
 
+    def update_db_writer_queue_status(self) -> None:
+        queued = self.db_write_queue.qsize()
+        maxsize = max(1, self.db_write_queue.maxsize)
+        ratio = queued / maxsize
+        threshold = self.settings().service.db_writer_degraded_queue_ratio
+        degraded = ratio >= threshold or self.db_writer_status.get("alert") is True
+        self.db_writer_status.update(
+            {
+                "queued": queued,
+                "queue_maxsize": maxsize,
+                "queue_fill_ratio": round(ratio, 4),
+                "degraded": degraded,
+            }
+        )
+
     async def _db_writer_loop(self) -> None:
         while True:
             job = await self.db_write_queue.get()
@@ -455,6 +488,7 @@ class ApiState:
                             "accepting": False,
                             "running": False,
                             "stopped_reason": "disk_full",
+                            "degraded": True,
                         }
                     )
                     if job.future and not job.future.done():
@@ -466,14 +500,8 @@ class ApiState:
                     job.future.set_exception(exc)
             finally:
                 if self.db_writer_status.get("lifecycle") != "stopped":
-                    self.db_writer_status.update(
-                        {
-                            "lifecycle": "running",
-                            "running": True,
-                            "queued": self.db_write_queue.qsize(),
-                            "last_write_ts": int(time.time()),
-                        }
-                    )
+                    self.db_writer_status.update({"lifecycle": "running", "running": True, "last_write_ts": int(time.time())})
+                    self.update_db_writer_queue_status()
                     self.db_write_queue.task_done()
 
     async def _run_db_write_job(self, job: DBWriteJob) -> Any:
@@ -489,6 +517,8 @@ class ApiState:
 
     def db_write_max_attempts(self, exc: Exception) -> int:
         service = self.settings().service
+        if is_non_retryable_db_write_error(exc):
+            return 0
         if is_sqlite_locked_error(exc):
             return max(0, service.db_writer_locked_retries)
         if is_io_retryable_error(exc):
@@ -508,14 +538,18 @@ class ApiState:
         entry = {
             "job_id": job.id,
             "function": getattr(job.func, "__name__", str(job.func)),
+            "category": job.category,
             "attempt": job.attempt,
             "error_type": type(exc).__name__,
             "error": str(exc),
             "created_ts": job.created_ts,
             "failed_ts": int(time.time()),
         }
+        ttl_cutoff = int(time.time()) - max(1, self.settings().service.db_writer_dead_letter_ttl_days) * 86400
         self.db_writer_dead_letters.append(entry)
-        self.db_writer_dead_letters = self.db_writer_dead_letters[-100:]
+        self.db_writer_dead_letters = [
+            item for item in self.db_writer_dead_letters if int(item.get("failed_ts", 0)) >= ttl_cutoff
+        ][-max(1, self.settings().service.db_writer_dead_letter_max_records):]
         alert_threshold = self.settings().service.db_writer_failed_alert_threshold
         self.db_writer_status.update(
             {
@@ -523,6 +557,7 @@ class ApiState:
                 "last_error": entry,
                 "dead_letters": len(self.db_writer_dead_letters),
                 "alert": self.db_writer_failed_writes >= alert_threshold,
+                "degraded": self.db_writer_failed_writes >= alert_threshold,
             }
         )
         logger.warning(
@@ -550,6 +585,8 @@ class ApiState:
         func: Any,
         *args: Any,
         wait: bool = True,
+        category: str = "critical",
+        backpressure: str | None = None,
         **kwargs: Any,
     ) -> Any:
         current_loop = asyncio.get_running_loop()
@@ -572,16 +609,29 @@ class ApiState:
                 }
             )
             raise RuntimeError("DB writer is shutting down or stopped")
+        drop_categories = set(self.settings().service.db_writer_drop_categories)
+        policy = backpressure or ("drop" if category in drop_categories or not wait else "wait")
         future = current_loop.create_future() if wait else None
-        job = DBWriteJob(func=func, args=args, kwargs=kwargs, future=future)
+        job = DBWriteJob(func=func, args=args, kwargs=kwargs, future=future, category=category, backpressure=policy)
+        if self.db_write_queue.full() and policy == "drop":
+            self.db_writer_dropped_writes += 1
+            self.db_writer_status.update(
+                {
+                    "dropped_writes": self.db_writer_dropped_writes,
+                    "last_drop": {
+                        "job_id": job.id,
+                        "function": getattr(func, "__name__", str(func)),
+                        "category": category,
+                        "dropped_ts": int(time.time()),
+                    },
+                    "accepting": self.db_writer_accepting,
+                }
+            )
+            self.update_db_writer_queue_status()
+            return None
         await self.db_write_queue.put(job)
-        self.db_writer_status.update(
-            {
-                "queued": self.db_write_queue.qsize(),
-                "queue_maxsize": self.db_write_queue.maxsize,
-                "accepting": self.db_writer_accepting,
-            }
-        )
+        self.db_writer_status.update({"accepting": self.db_writer_accepting})
+        self.update_db_writer_queue_status()
         if future is None:
             return None
         return await future
@@ -701,7 +751,13 @@ class ApiState:
         client = await layer.authorized_client()
 
         async def handler(event: Any) -> None:
-            await self.enqueue_db_write(self.apply_raw_update, account_name, event, wait=False)
+            await self.enqueue_db_write(
+                self.apply_raw_update,
+                account_name,
+                event,
+                wait=False,
+                category="diagnostics",
+            )
             self.online_status.setdefault(account_name, {})
             self.online_status[account_name].update(
                 {
@@ -1202,9 +1258,26 @@ class ApiState:
                 auto_vacuum = int(connection.execute("pragma auto_vacuum").fetchone()[0] or 0)
                 if auto_vacuum == 0:
                     connection.execute("pragma auto_vacuum=incremental")
-                    connection.execute("vacuum")
+                    self.state_db_maintenance_status.update(
+                        {
+                            "auto_vacuum": "none",
+                            "migration_required": True,
+                            "message": "Run POST /db/vacuum/migrate to enable incremental vacuum on this SQLite file.",
+                        }
+                    )
                 elif auto_vacuum != 2:
                     connection.execute("pragma auto_vacuum=incremental")
+                    self.state_db_maintenance_status.update(
+                        {
+                            "auto_vacuum": auto_vacuum,
+                            "migration_required": True,
+                            "message": "Run POST /db/vacuum/migrate to apply auto_vacuum change.",
+                        }
+                    )
+                else:
+                    self.state_db_maintenance_status.update(
+                        {"auto_vacuum": "incremental", "migration_required": False}
+                    )
                 self._state_db_auto_vacuum_checked = True
         self.ensure_state_schema(connection)
         return connection
@@ -1250,11 +1323,65 @@ class ApiState:
         if time.monotonic() - self.last_state_vacuum_at < vacuum_interval:
             return
         with self.state_db_lock:
-            connection = self.open_state_db()
-            freelist_count = int(connection.execute("pragma freelist_count").fetchone()[0] or 0)
-            if freelist_count > 0:
-                connection.execute(f"pragma incremental_vacuum({min(freelist_count, 1000)})")
-            self.last_state_vacuum_at = time.monotonic()
+            with self.state_db_context() as connection:
+                freelist_count = int(connection.execute("pragma freelist_count").fetchone()[0] or 0)
+                if freelist_count > 0:
+                    connection.execute(f"pragma incremental_vacuum({min(freelist_count, 1000)})")
+                self.last_state_vacuum_at = time.monotonic()
+
+    def migrate_state_db_auto_vacuum(self) -> dict[str, Any]:
+        path = self.state_db_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        db_size = path.stat().st_size if path.exists() else 0
+        free_bytes = shutil.disk_usage(path.parent).free
+        required_bytes = max(db_size * 2, 1)
+        if free_bytes < required_bytes:
+            raise HTTPException(
+                status_code=507,
+                detail={
+                    "message": "Not enough free disk space for SQLite VACUUM migration.",
+                    "db_size_bytes": db_size,
+                    "free_bytes": free_bytes,
+                    "required_bytes": required_bytes,
+                },
+            )
+        with self.state_db_lock:
+            started = int(time.time())
+            self.state_db_maintenance_status.update(
+                {
+                    "migration_running": True,
+                    "migration_started_ts": started,
+                    "db_size_bytes": db_size,
+                    "free_bytes_before": free_bytes,
+                }
+            )
+            try:
+                with self.state_db_context() as connection:
+                    connection.execute("pragma auto_vacuum=incremental")
+                    connection.execute("vacuum")
+                    auto_vacuum = int(connection.execute("pragma auto_vacuum").fetchone()[0] or 0)
+            except Exception as exc:
+                self.state_db_maintenance_status.update(
+                    {
+                        "migration_running": False,
+                        "migration_error": str(exc),
+                        "migration_error_type": type(exc).__name__,
+                        "migration_failed_ts": int(time.time()),
+                    }
+                )
+                raise
+            self._state_db_auto_vacuum_checked = False
+            result = {
+                "migration_running": False,
+                "migration_required": auto_vacuum != 2,
+                "auto_vacuum": auto_vacuum,
+                "db_size_bytes": path.stat().st_size if path.exists() else 0,
+                "free_bytes_after": shutil.disk_usage(path.parent).free,
+                "migration_started_ts": started,
+                "migration_finished_ts": int(time.time()),
+            }
+            self.state_db_maintenance_status.update(result)
+            return result
 
     def begin_idempotent_action(
         self,
@@ -1267,6 +1394,7 @@ class ApiState:
             return "missing", None, None
         payload_hash = idempotency_payload_hash(payload)
         now = int(time.time())
+        lease_seconds = self.idempotency_lease_seconds_for_action(action, payload)
         with self.state_db_context() as connection:
             row = connection.execute(
                 """
@@ -1285,7 +1413,7 @@ class ApiState:
                     )
                 if status == "completed":
                     return "completed", payload_hash, json.loads(result_json or "{}")
-                if int(locked_until or 0) <= now and status in {"in_progress", "unknown", "retryable"}:
+                if int(locked_until or 0) <= now and status in {"in_progress", "failed_retryable"}:
                     connection.execute(
                         """
                         update idempotency_keys
@@ -1293,7 +1421,7 @@ class ApiState:
                         where account = ? and action = ? and idempotency_key = ?
                         """,
                         (
-                            now + self.settings().service.idempotency_lease_seconds,
+                            now + lease_seconds,
                             now,
                             account,
                             action,
@@ -1318,12 +1446,69 @@ class ApiState:
                     action,
                     key,
                     payload_hash,
-                    now + self.settings().service.idempotency_lease_seconds,
+                    now + lease_seconds,
                     now,
                     now,
                 ),
             )
         return "started", payload_hash, None
+
+    def refresh_idempotent_action(
+        self,
+        account: str,
+        action: str,
+        key: str | None,
+        payload_hash: str | None,
+        lease_seconds: int | None = None,
+    ) -> None:
+        if not key or not payload_hash:
+            return
+        now = int(time.time())
+        locked_until = now + max(1, lease_seconds or self.idempotency_lease_seconds_for_action(action))
+        with self.state_db_context() as connection:
+            connection.execute(
+                """
+                update idempotency_keys
+                set locked_until = ?, updated_ts = ?
+                where account = ? and action = ? and idempotency_key = ?
+                    and payload_hash = ? and status = 'in_progress'
+                """,
+                (locked_until, now, account, action, key, payload_hash),
+            )
+
+    async def idempotency_heartbeat(
+        self,
+        account: str,
+        action: str,
+        key: str | None,
+        payload_hash: str | None,
+        lease_seconds: int | None = None,
+    ) -> None:
+        if not key or not payload_hash:
+            return
+        service = self.settings().service
+        min_seconds = max(1, service.idempotency_heartbeat_min_seconds)
+        max_seconds = max(min_seconds, service.idempotency_heartbeat_max_seconds)
+        while True:
+            await asyncio.sleep(random.uniform(min_seconds, max_seconds))
+            await asyncio.to_thread(
+                self.refresh_idempotent_action,
+                account,
+                action,
+                key,
+                payload_hash,
+                lease_seconds,
+            )
+
+    def idempotency_lease_seconds_for_action(self, action: str, payload: Any | None = None) -> int:
+        service = self.settings().service
+        if action in {"media.send", "files.upload", "media.download"}:
+            if payload_has_large_file(payload):
+                return service.idempotency_large_file_lease_seconds
+            return service.idempotency_media_lease_seconds
+        if action.startswith("messages."):
+            return service.idempotency_message_lease_seconds
+        return service.idempotency_lease_seconds
 
     def complete_idempotent_action(
         self,
@@ -1366,7 +1551,7 @@ class ApiState:
         if not key or not payload_hash:
             return
         now = int(time.time())
-        locked_until = now + self.settings().service.idempotency_lease_seconds
+        locked_until = now + self.idempotency_lease_seconds_for_action(action)
         with self.state_db_context() as connection:
             connection.execute(
                 """
@@ -1376,6 +1561,44 @@ class ApiState:
                 """,
                 (status, locked_until, now, account, action, key, payload_hash),
             )
+
+    def resolve_idempotent_action(
+        self,
+        account: str,
+        action: str,
+        key: str,
+        status: str,
+        result: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        account_name = self.resolve_account(account)
+        now = int(time.time())
+        result_json = safe_json_dumps(result or {}) if status == "completed" else None
+        with self.state_db_context() as connection:
+            row = connection.execute(
+                """
+                select status
+                from idempotency_keys
+                where account = ? and action = ? and idempotency_key = ?
+                """,
+                (account_name, action, key),
+            ).fetchone()
+            if row is None:
+                raise HTTPException(status_code=404, detail="Idempotency key not found.")
+            connection.execute(
+                """
+                update idempotency_keys
+                set status = ?, result_json = ?, locked_until = 0, updated_ts = ?
+                where account = ? and action = ? and idempotency_key = ?
+                """,
+                (status, result_json, now, account_name, action, key),
+            )
+        return {
+            "account": account_name,
+            "action": action,
+            "idempotency_key": key,
+            "previous_status": row[0],
+            "status": status,
+        }
 
     @staticmethod
     def ensure_state_schema(connection: sqlite3.Connection) -> None:
@@ -1665,6 +1888,10 @@ class ServiceSettingsPayload(BaseModel):
     db_writer_locked_retries: int = Field(default=3, ge=0)
     db_writer_io_retries: int = Field(default=2, ge=0)
     db_writer_failed_alert_threshold: int = Field(default=10, ge=1)
+    db_writer_dead_letter_max_records: int = Field(default=500, ge=1, le=1000)
+    db_writer_dead_letter_ttl_days: int = Field(default=30, ge=1)
+    db_writer_degraded_queue_ratio: float = Field(default=0.8, ge=0.1, le=1.0)
+    db_writer_drop_categories: list[str] = Field(default_factory=lambda: ["diagnostics", "typing", "presence"])
     keep_accounts_online: bool = False
     online_update_interval_seconds: int = Field(default=300, ge=15)
     online_update_min_interval_seconds: int = Field(default=300, ge=15)
@@ -1689,6 +1916,11 @@ class ServiceSettingsPayload(BaseModel):
     idempotency_retention_hours: int = Field(default=48, ge=1)
     idempotency_max_records: int = Field(default=10000, ge=1)
     idempotency_lease_seconds: int = Field(default=300, ge=1)
+    idempotency_message_lease_seconds: int = Field(default=300, ge=60)
+    idempotency_media_lease_seconds: int = Field(default=3600, ge=300)
+    idempotency_large_file_lease_seconds: int = Field(default=7200, ge=300)
+    idempotency_heartbeat_min_seconds: int = Field(default=30, ge=1)
+    idempotency_heartbeat_max_seconds: int = Field(default=60, ge=1)
     idempotency_result_max_bytes: int = Field(default=1048576, ge=1024)
     state_retention_min_interval_hours: int = Field(default=12, ge=1)
     state_retention_max_interval_hours: int = Field(default=24, ge=1)
@@ -1783,6 +2015,14 @@ class UploadFilePayload(BaseModel):
     file_path: str | None = None
     file_base64: str | None = None
     file_name: str | None = None
+
+
+class IdempotencyResolvePayload(BaseModel):
+    account: str | None = None
+    action: str
+    idempotency_key: str
+    status: str = Field(pattern="^(failed_retryable|failed_final|completed)$")
+    result: dict[str, Any] | None = None
 
 
 class EntityPayload(BaseModel):
@@ -1959,6 +2199,7 @@ def create_app(state: ApiState) -> FastAPI:
         except FloodWaitError as exc:
             flood_account = REQUEST_TELEGRAM_ACCOUNT.get() or account
             flood_action = REQUEST_TELEGRAM_ACTION.get()
+            state.invalidate_connection_health(flood_account, exc)
             state.record_flood_wait(flood_account, flood_action, getattr(exc, "seconds", None))
             await audit_request(state, request, 429, token)
             return JSONResponse(
@@ -1973,6 +2214,7 @@ def create_app(state: ApiState) -> FastAPI:
                 headers={"Retry-After": str(getattr(exc, "seconds", 60))},
             )
         except RPCError as exc:
+            state.invalidate_connection_health(REQUEST_TELEGRAM_ACCOUNT.get() or account, exc)
             await audit_request(state, request, 502, token)
             return JSONResponse(
                 {
@@ -1989,6 +2231,7 @@ def create_app(state: ApiState) -> FastAPI:
             await audit_request(state, request, 400, token)
             return JSONResponse({"detail": str(exc)}, status_code=400)
         except ConnectionError as exc:
+            state.invalidate_connection_health(REQUEST_TELEGRAM_ACCOUNT.get() or account, exc)
             await audit_request(state, request, 503, token)
             return JSONResponse(
                 {"detail": "Telegram connection failed", "message": str(exc)},
@@ -2000,12 +2243,19 @@ def create_app(state: ApiState) -> FastAPI:
             REQUEST_SCOPES.reset(scope_token)
 
     @app.get("/health")
-    async def health() -> dict[str, str]:
-        return {
+    async def health() -> JSONResponse:
+        db_writer = state.db_writer_status
+        degraded = bool(db_writer.get("degraded") or db_writer.get("alert"))
+        payload = {
             "status": "ok",
             "server_os": "windows" if os.name == "nt" else "linux",
             "path_style": "windows" if os.name == "nt" else "posix",
+            "db_writer": db_writer,
         }
+        if degraded:
+            payload["status"] = "degraded"
+            return JSONResponse(payload, status_code=503)
+        return JSONResponse(payload)
 
     @app.get("/capabilities")
     async def capabilities() -> dict[str, Any]:
@@ -2021,10 +2271,13 @@ def create_app(state: ApiState) -> FastAPI:
                         "GET /accounts/health",
                         "GET /accounts/risk-status",
                         "GET /db/writer/status",
+                        "GET /db/maintenance/status",
+                        "POST /db/vacuum/migrate",
                         "POST /accounts/entity-cache/warm",
                         "GET /accounts/entity-cache",
                         "GET /accounts/sync-state",
                         "POST /accounts/sync/difference",
+                        "POST /idempotency/resolve",
                         "POST /messages/list",
                         "POST /messages/typing",
                         "POST /messages/read",
@@ -2276,6 +2529,32 @@ def create_app(state: ApiState) -> FastAPI:
             "dead_letters": state.db_writer_dead_letters,
         }
 
+    @app.get("/db/maintenance/status")
+    async def db_maintenance_status() -> dict[str, Any]:
+        return {
+            "state_db": str(state.state_db_path()),
+            "maintenance": state.state_db_maintenance_status,
+        }
+
+    @app.post("/db/vacuum/migrate")
+    async def migrate_db_vacuum() -> dict[str, Any]:
+        ensure_admin_scope()
+        return await asyncio.to_thread(state.migrate_state_db_auto_vacuum)
+
+    @app.post("/idempotency/resolve")
+    async def resolve_idempotency(payload: IdempotencyResolvePayload) -> dict[str, Any]:
+        ensure_admin_scope()
+        account_name = state.resolve_account(payload.account)
+        ensure_account_allowed_for_payload(state, account_name)
+        return await asyncio.to_thread(
+            state.resolve_idempotent_action,
+            account_name,
+            payload.action,
+            payload.idempotency_key,
+            payload.status,
+            payload.result,
+        )
+
     @app.get("/queue/status")
     async def queue_status() -> dict[str, Any]:
         task = state.queue_worker_task
@@ -2373,6 +2652,7 @@ def create_app(state: ApiState) -> FastAPI:
                     "Call with recovery=true only when repairing local sync state."
                 ),
             )
+        ensure_admin_scope()
         ensure_telegram_rate(state, account, "updates.difference")
         account_name = state.resolve_account(account)
         client = await require_authorized_client(state, account_name)
@@ -2530,6 +2810,16 @@ def create_app(state: ApiState) -> FastAPI:
         )
         if idem_status == "completed" and cached_result is not None:
             return cached_result
+        lease_seconds = state.idempotency_lease_seconds_for_action("messages.send", payload.model_dump())
+        heartbeat_task = asyncio.create_task(
+            state.idempotency_heartbeat(
+                account_name,
+                "messages.send",
+                idempotency_key,
+                payload_hash,
+                lease_seconds,
+            )
+        )
         await state.mark_user_activity(account, send_online=True)
         try:
             layer = await state.require_layer(account)
@@ -2556,9 +2846,13 @@ def create_app(state: ApiState) -> FastAPI:
                 "messages.send",
                 idempotency_key,
                 payload_hash,
-                "unknown",
+                "outcome_unknown",
             )
             raise
+        finally:
+            heartbeat_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat_task
         return result
 
     @app.post("/messages/typing")
@@ -2642,6 +2936,19 @@ def create_app(state: ApiState) -> FastAPI:
         )
         if idem_status == "completed" and cached_result is not None:
             return cached_result
+        lease_seconds = state.idempotency_lease_seconds_for_action(
+            "messages.send_username",
+            payload.model_dump(),
+        )
+        heartbeat_task = asyncio.create_task(
+            state.idempotency_heartbeat(
+                account_name,
+                "messages.send_username",
+                idempotency_key,
+                payload_hash,
+                lease_seconds,
+            )
+        )
         await state.mark_user_activity(account, send_online=True)
         try:
             layer = await state.require_layer(account)
@@ -2668,9 +2975,13 @@ def create_app(state: ApiState) -> FastAPI:
                 "messages.send_username",
                 idempotency_key,
                 payload_hash,
-                "unknown",
+                "outcome_unknown",
             )
             raise
+        finally:
+            heartbeat_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat_task
         return result
 
     @app.post("/messages/edit")
@@ -2764,6 +3075,16 @@ def create_app(state: ApiState) -> FastAPI:
         )
         if idem_status == "completed" and cached_result is not None:
             return cached_result
+        lease_seconds = state.idempotency_lease_seconds_for_action("media.send", payload.model_dump())
+        heartbeat_task = asyncio.create_task(
+            state.idempotency_heartbeat(
+                account_name,
+                "media.send",
+                idempotency_key,
+                payload_hash,
+                lease_seconds,
+            )
+        )
         await state.mark_user_activity(account, send_online=True)
         try:
             client = await require_authorized_client(state, account)
@@ -2794,9 +3115,13 @@ def create_app(state: ApiState) -> FastAPI:
                 "media.send",
                 idempotency_key,
                 payload_hash,
-                "unknown",
+                "outcome_unknown",
             )
             raise
+        finally:
+            heartbeat_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat_task
         return result
 
     @app.post("/media/download")
@@ -3543,6 +3868,7 @@ def should_serialize_http_path(path: str) -> bool:
         "/accounts/online",
         "/accounts/risk-status",
         "/db/writer/status",
+        "/db/maintenance/status",
     }:
         return False
     if path.startswith(("/docs", "/redoc", "/openapi.json", "/events", "/ws/")):
@@ -3600,6 +3926,21 @@ def idempotency_payload_hash(payload: Any) -> str:
     return hashlib.sha256(safe_json_dumps(payload).encode("utf-8")).hexdigest()
 
 
+def payload_has_large_file(payload: Any, *, threshold_bytes: int = 100 * 1024 * 1024) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    file_path = payload.get("file_path")
+    if file_path:
+        try:
+            return Path(str(file_path)).expanduser().stat().st_size >= threshold_bytes
+        except OSError:
+            return False
+    file_base64 = payload.get("file_base64")
+    if isinstance(file_base64, str):
+        return len(file_base64) * 3 // 4 >= threshold_bytes
+    return False
+
+
 def is_sqlite_locked_error(exc: Exception) -> bool:
     return isinstance(exc, sqlite3.OperationalError) and "database is locked" in str(exc).lower()
 
@@ -3619,11 +3960,24 @@ def is_disk_full_error(exc: Exception) -> bool:
 def is_io_retryable_error(exc: Exception) -> bool:
     if is_disk_full_error(exc):
         return False
+    if isinstance(exc, PermissionError):
+        return False
     if isinstance(exc, OSError):
         return True
     message = str(exc).lower()
+    if any(marker in message for marker in ("schema", "malformed", "not a database", "permission")):
+        return False
     return isinstance(exc, sqlite3.OperationalError) and any(
         marker in message for marker in ("i/o", "io error", "unable to open database file")
+    )
+
+
+def is_non_retryable_db_write_error(exc: Exception) -> bool:
+    if is_disk_full_error(exc) or isinstance(exc, PermissionError):
+        return True
+    message = str(exc).lower()
+    return isinstance(exc, sqlite3.DatabaseError) and any(
+        marker in message for marker in ("schema", "malformed", "not a database", "permission")
     )
 
 
@@ -3738,6 +4092,12 @@ def ensure_account_allowed_for_payload(state: ApiState, account: str | None) -> 
     scopes = REQUEST_SCOPES.get()
     if scopes is not None and not account_allowed(scopes, account or state.settings().active_account):
         raise HTTPException(status_code=403, detail="Account is not allowed for this token")
+
+
+def ensure_admin_scope() -> None:
+    scopes = REQUEST_SCOPES.get()
+    if scopes is not None and "*" not in scopes:
+        raise HTTPException(status_code=403, detail="Admin scope is required")
 
 
 async def ensure_websocket_allowed(
@@ -3859,6 +4219,16 @@ async def dispatch_rpc(state: ApiState, method: str, params: dict[str, Any]) -> 
         )
         if idem_status == "completed" and cached_result is not None:
             return cached_result
+        lease_seconds = state.idempotency_lease_seconds_for_action("messages.send", params)
+        heartbeat_task = asyncio.create_task(
+            state.idempotency_heartbeat(
+                account_name,
+                "messages.send",
+                idempotency_key,
+                payload_hash,
+                lease_seconds,
+            )
+        )
         await state.mark_user_activity(account, send_online=True)
         try:
             layer = await state.require_layer(account)
@@ -3883,9 +4253,13 @@ async def dispatch_rpc(state: ApiState, method: str, params: dict[str, Any]) -> 
                 "messages.send",
                 idempotency_key,
                 payload_hash,
-                "unknown",
+                "outcome_unknown",
             )
             raise
+        finally:
+            heartbeat_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat_task
         return result
     if method == "messages.send_username":
         ensure_telegram_rate(state, account, "messages.send")
@@ -3904,6 +4278,16 @@ async def dispatch_rpc(state: ApiState, method: str, params: dict[str, Any]) -> 
         )
         if idem_status == "completed" and cached_result is not None:
             return cached_result
+        lease_seconds = state.idempotency_lease_seconds_for_action("messages.send_username", params)
+        heartbeat_task = asyncio.create_task(
+            state.idempotency_heartbeat(
+                account_name,
+                "messages.send_username",
+                idempotency_key,
+                payload_hash,
+                lease_seconds,
+            )
+        )
         await state.mark_user_activity(account, send_online=True)
         try:
             layer = await state.require_layer(account)
@@ -3928,9 +4312,13 @@ async def dispatch_rpc(state: ApiState, method: str, params: dict[str, Any]) -> 
                 "messages.send_username",
                 idempotency_key,
                 payload_hash,
-                "unknown",
+                "outcome_unknown",
             )
             raise
+        finally:
+            heartbeat_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat_task
         return result
     if method == "messages.edit":
         ensure_telegram_rate(state, account, "messages.edit")
@@ -3979,6 +4367,16 @@ async def dispatch_rpc(state: ApiState, method: str, params: dict[str, Any]) -> 
         )
         if idem_status == "completed" and cached_result is not None:
             return cached_result
+        lease_seconds = state.idempotency_lease_seconds_for_action("media.send", params)
+        heartbeat_task = asyncio.create_task(
+            state.idempotency_heartbeat(
+                account_name,
+                "media.send",
+                idempotency_key,
+                payload_hash,
+                lease_seconds,
+            )
+        )
         await state.mark_user_activity(account, send_online=True)
         try:
             client = await require_authorized_client(state, account)
@@ -4013,9 +4411,13 @@ async def dispatch_rpc(state: ApiState, method: str, params: dict[str, Any]) -> 
                 "media.send",
                 idempotency_key,
                 payload_hash,
-                "unknown",
+                "outcome_unknown",
             )
             raise
+        finally:
+            heartbeat_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat_task
         return result
     if method == "tl.construct":
         layer = await state.require_layer(account)

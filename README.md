@@ -314,6 +314,9 @@ http://127.0.0.1:8080/docs
 - `GET /queue/jobs`
 - `GET /queue/jobs/{job_id}`
 - `GET /db/writer/status`
+- `GET /db/maintenance/status`
+- `POST /db/vacuum/migrate`
+- `POST /idempotency/resolve`
 - `GET /capabilities`
 - `POST /actions/resolve`
 - `POST /actions/execute`
@@ -620,9 +623,35 @@ DB writer health and failed asynchronous writes:
 curl http://127.0.0.1:8080/db/writer/status
 ```
 
+Idempotency states:
+
+- `in_progress` - the request is still running and duplicate calls are blocked while the lease is active.
+- `completed` - the previous stable JSON result is returned for the same key and payload.
+- `failed_retryable` - an admin explicitly allowed retry; the next matching call may run again.
+- `failed_final` - the key is closed and should not be retried.
+- `outcome_unknown` - the server cannot prove whether Telegram applied the action; do not retry automatically.
+
+Admin resolution for an unknown/final idempotency key:
+
+```bash
+curl -X POST http://127.0.0.1:8080/idempotency/resolve \
+  -H 'Authorization: Bearer admin-token' \
+  -H 'Content-Type: application/json' \
+  -d '{"account":"work","action":"messages.send","idempotency_key":"key-1","status":"failed_retryable"}'
+```
+
+SQLite maintenance status and explicit auto-vacuum migration:
+
+```bash
+curl http://127.0.0.1:8080/db/maintenance/status
+curl -X POST http://127.0.0.1:8080/db/vacuum/migrate \
+  -H 'Authorization: Bearer admin-token'
+```
+
 Manual `updates.GetDifferenceRequest` calls should be treated as an admin recovery tool.
 Normal synchronization is handled by Telethon. Do not call difference in a polling loop from
 external clients, because a partial external sync model can diverge from Telegram channel state.
+The endpoint requires `recovery=true` and an admin token with `*` scope when token scopes are enabled.
 
 Сейчас очередь хранится в памяти процесса. Для production-нагрузки следующим
 слоем можно подключить Redis, RabbitMQ или NATS без изменения внешнего API.

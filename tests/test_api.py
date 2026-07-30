@@ -7,6 +7,7 @@ from telethon.tl.types import User
 
 from tg_api_zapret.api import (
     ApiState,
+    DBWriteJob,
     create_app,
     normalize_username_entity,
     serialize_dialog,
@@ -243,6 +244,89 @@ def test_idempotency_in_progress_lease_blocks_then_allows_retry(tmp_path) -> Non
     assert status == "started"
 
 
+def test_idempotency_outcome_unknown_requires_manual_resolution(tmp_path) -> None:
+    state = ApiState(config_file=str(tmp_path / "config.json"), session_file=str(tmp_path / "s.txt"))
+
+    status, payload_hash, _ = state.begin_idempotent_action(
+        "default",
+        "messages.send",
+        "unknown-key",
+        {"text": "hello"},
+    )
+    assert status == "started"
+    state.mark_idempotent_action(
+        "default",
+        "messages.send",
+        "unknown-key",
+        payload_hash,
+        "outcome_unknown",
+    )
+    with state.state_db_context() as connection:
+        connection.execute(
+            """
+            update idempotency_keys
+            set locked_until = 0
+            where account = 'default' and action = 'messages.send' and idempotency_key = 'unknown-key'
+            """
+        )
+
+    try:
+        state.begin_idempotent_action(
+            "default",
+            "messages.send",
+            "unknown-key",
+            {"text": "hello"},
+        )
+    except HTTPException as exc:
+        assert exc.status_code == 409
+        assert "outcome_unknown" in exc.detail
+    else:
+        raise AssertionError("outcome_unknown must require manual resolution")
+
+    state.resolve_idempotent_action("default", "messages.send", "unknown-key", "failed_retryable")
+    status, _, _ = state.begin_idempotent_action(
+        "default",
+        "messages.send",
+        "unknown-key",
+        {"text": "hello"},
+    )
+    assert status == "started"
+
+
+def test_idempotency_heartbeat_extends_lease(tmp_path) -> None:
+    state = ApiState(config_file=str(tmp_path / "config.json"), session_file=str(tmp_path / "s.txt"))
+    _, payload_hash, _ = state.begin_idempotent_action(
+        "default",
+        "media.send",
+        "heartbeat-key",
+        {"file_path": "small.jpg"},
+    )
+    with state.state_db_context() as connection:
+        connection.execute(
+            """
+            update idempotency_keys
+            set locked_until = 1
+            where account = 'default' and action = 'media.send' and idempotency_key = 'heartbeat-key'
+            """
+        )
+
+    state.refresh_idempotent_action(
+        "default",
+        "media.send",
+        "heartbeat-key",
+        payload_hash,
+        lease_seconds=3600,
+    )
+    with state.state_db_context() as connection:
+        after = connection.execute(
+            """
+            select locked_until from idempotency_keys
+            where account = 'default' and action = 'media.send' and idempotency_key = 'heartbeat-key'
+            """
+        ).fetchone()[0]
+    assert after > 1
+
+
 def test_db_writer_rejects_enqueue_after_shutdown(tmp_path) -> None:
     state = ApiState(config_file=str(tmp_path / "config.json"), session_file=str(tmp_path / "s.txt"))
 
@@ -261,3 +345,31 @@ def test_db_writer_rejects_enqueue_after_shutdown(tmp_path) -> None:
             raise AssertionError("enqueue after shutdown must be rejected")
 
     asyncio.run(run())
+
+
+def test_db_writer_drops_diagnostics_when_queue_is_full(tmp_path) -> None:
+    state = ApiState(config_file=str(tmp_path / "config.json"), session_file=str(tmp_path / "s.txt"))
+    state.db_write_queue = asyncio.Queue(maxsize=1)
+
+    def write_marker() -> str:
+        return "ok"
+
+    async def run_drop() -> None:
+        holder = asyncio.create_task(asyncio.sleep(3600))
+        state.db_writer_task = holder
+        state.db_writer_loop = asyncio.get_running_loop()
+        state.db_writer_accepting = True
+        state.db_writer_status["lifecycle"] = "running"
+        state.db_write_queue.put_nowait(
+            DBWriteJob(func=write_marker, args=(), kwargs={}, future=None)
+        )
+        await state.enqueue_db_write(write_marker, wait=False, category="diagnostics")
+        assert state.db_writer_dropped_writes == 1
+        assert state.db_writer_status["degraded"] is True
+        holder.cancel()
+        try:
+            await holder
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(run_drop())

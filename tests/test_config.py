@@ -151,6 +151,10 @@ def test_partial_service_settings_uses_safety_defaults(tmp_path) -> None:
     assert loaded.service.db_writer_locked_retries == 3
     assert loaded.service.db_writer_io_retries == 2
     assert loaded.service.db_writer_failed_alert_threshold == 10
+    assert loaded.service.db_writer_dead_letter_max_records == 500
+    assert loaded.service.db_writer_dead_letter_ttl_days == 30
+    assert loaded.service.db_writer_degraded_queue_ratio == 0.8
+    assert loaded.service.db_writer_drop_categories == ["diagnostics", "typing", "presence"]
     assert loaded.service.keep_accounts_online is False
     assert loaded.service.online_update_interval_seconds == 300
     assert loaded.service.online_update_min_interval_seconds == 300
@@ -172,6 +176,11 @@ def test_partial_service_settings_uses_safety_defaults(tmp_path) -> None:
     assert loaded.service.idempotency_retention_hours == 48
     assert loaded.service.idempotency_max_records == 10000
     assert loaded.service.idempotency_lease_seconds == 300
+    assert loaded.service.idempotency_message_lease_seconds == 300
+    assert loaded.service.idempotency_media_lease_seconds == 3600
+    assert loaded.service.idempotency_large_file_lease_seconds == 7200
+    assert loaded.service.idempotency_heartbeat_min_seconds == 30
+    assert loaded.service.idempotency_heartbeat_max_seconds == 60
     assert loaded.service.idempotency_result_max_bytes == 1048576
     assert loaded.service.state_retention_min_interval_hours == 12
     assert loaded.service.state_retention_max_interval_hours == 24
