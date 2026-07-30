@@ -224,7 +224,7 @@ class ApiState:
         if service.passive_update_receiver:
             await self.start_passive_update_receiver(account_name)
         if service.entity_cache_warmup_dialogs > 0:
-            await self.warm_entity_cache(account_name, limit=service.entity_cache_warmup_dialogs)
+            await self.warm_entity_cache(account_name, limit=self.entity_cache_warmup_limit())
         if service.reconnect_enabled:
             self.start_reconnect_loop(account_name)
         self.start_desktop_sync_loop(account_name)
@@ -339,11 +339,11 @@ class ApiState:
                 pass
 
     async def _reconnect_loop(self, account: str) -> None:
-        delay = self.settings().service.reconnect_min_delay_seconds
         while True:
             service = self.settings().service
             min_delay = max(1, service.reconnect_min_delay_seconds)
             max_delay = max(min_delay, service.reconnect_max_delay_seconds)
+            delay = random.uniform(min_delay, max_delay)
             try:
                 layer = await self.require_layer(account)
                 client = await layer.authorized_client()
@@ -364,7 +364,7 @@ class ApiState:
                         "last_check_ts": int(time.time()),
                     }
                     if service.entity_cache_warmup_dialogs > 0:
-                        await self.warm_entity_cache(account, limit=service.entity_cache_warmup_dialogs)
+                        await self.warm_entity_cache(account, limit=self.entity_cache_warmup_limit())
                 else:
                     self.set_account_state(account, "revoked")
                 delay = min_delay
@@ -376,13 +376,12 @@ class ApiState:
                     "ok": False,
                     "error": str(exc),
                     "last_check_ts": int(time.time()),
-                    "next_retry_seconds": delay,
+                    "next_retry_seconds": round(delay, 2),
                 }
                 self.set_account_state(account, "disconnected")
                 await asyncio.sleep(delay)
-                delay = min(delay * 2, max_delay)
                 continue
-            await asyncio.sleep(max(min_delay, delay))
+            await asyncio.sleep(delay)
 
     async def _desktop_sync_loop(self, account: str) -> None:
         next_ping = 0.0
@@ -402,11 +401,19 @@ class ApiState:
                 self.set_account_state(account, "updating")
                 if now >= next_ping:
                     await client(functions.PingRequest(ping_id=random.getrandbits(63)))
-                    next_ping = now + max(15, service.health_ping_interval_seconds)
+                    next_ping = now + random_interval(
+                        service.health_ping_interval_seconds,
+                        service.health_ping_max_interval_seconds,
+                        floor=15,
+                    )
                 if now >= next_state:
                     state_result = await client(functions.updates.GetStateRequest())
                     self.update_sync_state_from_object(account, state_result)
-                    next_state = now + max(60, service.health_get_state_interval_seconds)
+                    next_state = now + random_interval(
+                        service.health_get_state_interval_seconds,
+                        service.health_get_state_max_interval_seconds,
+                        floor=30,
+                    )
                 if now >= next_difference:
                     sync_state = self.sync_states.get(account)
                     if sync_state is None:
@@ -420,14 +427,22 @@ class ApiState:
                         )
                     )
                     self.apply_difference(account, difference)
-                    next_difference = now + max(120, service.health_get_difference_interval_seconds)
+                    next_difference = now + random_interval(
+                        service.health_get_difference_interval_seconds,
+                        service.health_get_difference_max_interval_seconds,
+                        floor=60,
+                    )
                 if now >= next_dialogs:
                     if service.entity_cache_warmup_dialogs > 0:
                         await self.warm_entity_cache(
                             account,
-                            limit=service.entity_cache_warmup_dialogs,
+                            limit=self.entity_cache_warmup_limit(),
                         )
-                    next_dialogs = now + max(60, service.health_dialog_refresh_interval_seconds)
+                    next_dialogs = now + random_interval(
+                        service.health_dialog_refresh_interval_seconds,
+                        service.health_dialog_refresh_max_interval_seconds,
+                        floor=60,
+                    )
                 self.connection_health.setdefault(account, {})
                 self.connection_health[account].update(
                     {
@@ -931,6 +946,14 @@ class ApiState:
             "updated_ts": int(time.time()),
         }
 
+    def entity_cache_warmup_limit(self) -> int:
+        service = self.settings().service
+        minimum = max(0, service.entity_cache_warmup_min_dialogs)
+        maximum = max(minimum, service.entity_cache_warmup_max_dialogs)
+        if maximum == 0:
+            return service.entity_cache_warmup_dialogs
+        return random.randint(minimum, maximum)
+
     def media_download_semaphore(self, account: str | None = None) -> asyncio.Semaphore:
         account_name = self.resolve_account(account)
         limit = self.settings().service.telegram_media_download_concurrency
@@ -1046,9 +1069,9 @@ class ServiceSettingsPayload(BaseModel):
     telegram_media_downloads_per_minute: int = Field(default=30, ge=1)
     telegram_media_download_concurrency: int = Field(default=2, ge=1, le=4)
     telegram_auth_requests_per_hour: int = Field(default=3, ge=1)
-    telegram_requests_per_second: int = Field(default=30, ge=1)
-    telegram_requests_per_minute: int = Field(default=100, ge=1)
-    telegram_requests_per_hour: int = Field(default=1000, ge=1)
+    telegram_requests_per_second: int = Field(default=50, ge=1)
+    telegram_requests_per_minute: int = Field(default=200, ge=1)
+    telegram_requests_per_hour: int = Field(default=2000, ge=1)
     max_dialog_limit: int = Field(default=100, ge=1)
     max_message_limit: int = Field(default=100, ge=1)
     blocked_account_names: list[str] = Field(default_factory=lambda: ["string", "account"])
@@ -1058,19 +1081,25 @@ class ServiceSettingsPayload(BaseModel):
     queue_default_max_attempts: int = Field(default=3, ge=1)
     queue_execute_in_api: bool = True
     keep_accounts_online: bool = True
-    online_update_interval_seconds: int = Field(default=30, ge=15)
-    online_update_min_interval_seconds: int = Field(default=30, ge=15)
-    online_update_max_interval_seconds: int = Field(default=45, ge=15)
+    online_update_interval_seconds: int = Field(default=25, ge=15)
+    online_update_min_interval_seconds: int = Field(default=25, ge=15)
+    online_update_max_interval_seconds: int = Field(default=50, ge=15)
     auto_connect_accounts: list[str] = Field(default_factory=list)
     reconnect_enabled: bool = True
     reconnect_min_delay_seconds: int = Field(default=1, ge=1)
-    reconnect_max_delay_seconds: int = Field(default=5, ge=1)
+    reconnect_max_delay_seconds: int = Field(default=3, ge=1)
     passive_update_receiver: bool = True
     entity_cache_warmup_dialogs: int = Field(default=50, ge=0)
-    health_ping_interval_seconds: int = Field(default=30, ge=15)
-    health_get_state_interval_seconds: int = Field(default=75, ge=60)
-    health_get_difference_interval_seconds: int = Field(default=150, ge=120)
-    health_dialog_refresh_interval_seconds: int = Field(default=300, ge=60)
+    entity_cache_warmup_min_dialogs: int = Field(default=40, ge=0)
+    entity_cache_warmup_max_dialogs: int = Field(default=60, ge=0)
+    health_ping_interval_seconds: int = Field(default=20, ge=15)
+    health_ping_max_interval_seconds: int = Field(default=30, ge=15)
+    health_get_state_interval_seconds: int = Field(default=45, ge=30)
+    health_get_state_max_interval_seconds: int = Field(default=60, ge=30)
+    health_get_difference_interval_seconds: int = Field(default=90, ge=60)
+    health_get_difference_max_interval_seconds: int = Field(default=120, ge=60)
+    health_dialog_refresh_interval_seconds: int = Field(default=180, ge=60)
+    health_dialog_refresh_max_interval_seconds: int = Field(default=240, ge=60)
     require_connection_health_before_auth: bool = True
     connection_health_timeout_seconds: int = Field(default=20, ge=1)
 
@@ -2803,6 +2832,12 @@ def to_unix_timestamp(value: Any) -> int:
     if isinstance(value, datetime):
         return int(value.timestamp())
     return int(value or 0)
+
+
+def random_interval(minimum: int | float, maximum: int | float, *, floor: int | float = 0) -> float:
+    low = max(float(floor), float(minimum))
+    high = max(low, float(maximum))
+    return random.uniform(low, high)
 
 
 def check_bucket(
