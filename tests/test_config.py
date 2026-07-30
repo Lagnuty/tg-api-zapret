@@ -147,6 +147,10 @@ def test_partial_service_settings_uses_safety_defaults(tmp_path) -> None:
     assert loaded.service.telegram_typing_requests_per_second == 1
     assert loaded.service.telegram_sync_requests_per_minute == 2
     assert loaded.service.queue_execute_in_api is True
+    assert loaded.service.db_writer_queue_maxsize == 5000
+    assert loaded.service.db_writer_locked_retries == 3
+    assert loaded.service.db_writer_io_retries == 2
+    assert loaded.service.db_writer_failed_alert_threshold == 10
     assert loaded.service.keep_accounts_online is False
     assert loaded.service.online_update_interval_seconds == 300
     assert loaded.service.online_update_min_interval_seconds == 300
@@ -162,10 +166,13 @@ def test_partial_service_settings_uses_safety_defaults(tmp_path) -> None:
     assert loaded.service.entity_cache_warmup_min_dialogs == 40
     assert loaded.service.entity_cache_warmup_max_dialogs == 60
     assert loaded.service.require_connection_health_before_auth is True
+    assert loaded.service.connection_health_cache_seconds == 30
     assert loaded.service.raw_updates_retention_days == 7
     assert loaded.service.flood_errors_retention_days == 30
     assert loaded.service.idempotency_retention_hours == 48
     assert loaded.service.idempotency_max_records == 10000
+    assert loaded.service.idempotency_lease_seconds == 300
+    assert loaded.service.idempotency_result_max_bytes == 1048576
     assert loaded.service.state_retention_min_interval_hours == 12
     assert loaded.service.state_retention_max_interval_hours == 24
     assert loaded.service.state_vacuum_interval_hours == 24

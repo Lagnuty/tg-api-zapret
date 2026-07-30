@@ -198,3 +198,66 @@ def test_idempotency_persists_and_validates_payload_hash(tmp_path) -> None:
         assert exc.status_code == 409
     else:
         raise AssertionError("different payload must be rejected")
+
+
+def test_idempotency_in_progress_lease_blocks_then_allows_retry(tmp_path) -> None:
+    config_file = tmp_path / "config.json"
+    state = ApiState(config_file=str(config_file), session_file=str(tmp_path / "s.txt"))
+
+    status, _, _ = state.begin_idempotent_action(
+        "default",
+        "messages.send",
+        "lease-key",
+        {"text": "hello"},
+    )
+    assert status == "started"
+
+    try:
+        state.begin_idempotent_action(
+            "default",
+            "messages.send",
+            "lease-key",
+            {"text": "hello"},
+        )
+    except HTTPException as exc:
+        assert exc.status_code == 409
+        assert "in_progress" in exc.detail
+    else:
+        raise AssertionError("active lease must block duplicate request")
+
+    with state.state_db_context() as connection:
+        connection.execute(
+            """
+            update idempotency_keys
+            set locked_until = 0
+            where account = 'default' and action = 'messages.send' and idempotency_key = 'lease-key'
+            """
+        )
+
+    status, _, _ = state.begin_idempotent_action(
+        "default",
+        "messages.send",
+        "lease-key",
+        {"text": "hello"},
+    )
+    assert status == "started"
+
+
+def test_db_writer_rejects_enqueue_after_shutdown(tmp_path) -> None:
+    state = ApiState(config_file=str(tmp_path / "config.json"), session_file=str(tmp_path / "s.txt"))
+
+    def write_marker() -> str:
+        return "ok"
+
+    async def run() -> None:
+        state.start_db_writer()
+        assert await state.enqueue_db_write(write_marker) == "ok"
+        await state.stop_db_writer()
+        try:
+            await state.enqueue_db_write(write_marker)
+        except RuntimeError as exc:
+            assert "shutting down" in str(exc)
+        else:
+            raise AssertionError("enqueue after shutdown must be rejected")
+
+    asyncio.run(run())

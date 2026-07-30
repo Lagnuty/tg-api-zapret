@@ -313,6 +313,7 @@ http://127.0.0.1:8080/docs
 - `POST /queue/jobs`
 - `GET /queue/jobs`
 - `GET /queue/jobs/{job_id}`
+- `GET /db/writer/status`
 - `GET /capabilities`
 - `POST /actions/resolve`
 - `POST /actions/execute`
@@ -612,6 +613,16 @@ curl -X POST http://127.0.0.1:8080/queue/jobs \
 ```bash
 curl http://127.0.0.1:8080/queue/jobs/<job_id>
 ```
+
+DB writer health and failed asynchronous writes:
+
+```bash
+curl http://127.0.0.1:8080/db/writer/status
+```
+
+Manual `updates.GetDifferenceRequest` calls should be treated as an admin recovery tool.
+Normal synchronization is handled by Telethon. Do not call difference in a polling loop from
+external clients, because a partial external sync model can diverge from Telegram channel state.
 
 Сейчас очередь хранится в памяти процесса. Для production-нагрузки следующим
 слоем можно подключить Redis, RabbitMQ или NATS без изменения внешнего API.
