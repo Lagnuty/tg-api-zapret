@@ -11,7 +11,7 @@ from typing import Sequence
 
 from telethon.errors import PasswordHashInvalidError, SessionPasswordNeededError
 
-from tg_api_zapret.api import ApiState, create_app, run_queue_worker
+from tg_api_zapret.api import ApiState, create_app
 from tg_api_zapret.client import TelegramLayer
 from tg_api_zapret.config import (
     AppSettings,
@@ -110,7 +110,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="Redis URL for --queue-backend redis.",
     )
 
-    worker = subparsers.add_parser("worker", help="Run production queue worker.")
+    worker = subparsers.add_parser(
+        "worker",
+        help="Deprecated guard. Queue jobs are executed by the API owner process.",
+    )
     worker.add_argument(
         "--queue-backend",
         choices=["redis"],
@@ -369,18 +372,11 @@ async def run_api(args: argparse.Namespace) -> None:
 
 
 async def run_worker(args: argparse.Namespace) -> None:
-    state = ApiState(
-        config_file=args.config_file,
-        session_file=args.session_file,
-        session_db=args.session_db,
-        default_account=resolve_account(args, AppSettings.load(args.config_file)),
-        queue_backend=args.queue_backend,
-        redis_url=args.redis_url,
+    raise RuntimeError(
+        "External queue workers are disabled. Start one API owner process with "
+        "`python -m tg_api_zapret api --queue-backend redis --redis-url ...`. "
+        "This prevents multiple processes from opening the same Telegram session."
     )
-    try:
-        await run_queue_worker(state, poll_timeout=args.poll_timeout)
-    finally:
-        await state.disconnect()
 
 
 def prompt_proxy_url() -> str:

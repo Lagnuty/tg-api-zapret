@@ -125,6 +125,7 @@ def test_partial_service_settings_uses_safety_defaults(tmp_path) -> None:
     assert loaded.service.telegram_join_actions_per_hour == 5
     assert loaded.service.telegram_destructive_actions_per_hour == 10
     assert loaded.service.telegram_default_flood_cooldown_seconds == 300
+    assert loaded.service.queue_execute_in_api is True
     assert loaded.service.keep_accounts_online is True
     assert loaded.service.online_update_interval_seconds == 55
     assert loaded.service.auto_connect_accounts == []

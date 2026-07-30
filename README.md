@@ -165,7 +165,7 @@ HTTP API.
 python -m tg_api_zapret set-client-profile \
   --device-model "Telegram Desktop" \
   --system-version "Linux x86_64" \
-  --app-version 0.4.16
+  --app-version 0.4.17
 ```
 
 Для уже существующей сессии Telegram может оставить старое название. Надежный
@@ -644,9 +644,18 @@ Redis выбран как первый production backend: для текущег
 Current queue semantics:
 
 - memory backend is for local development and runs jobs inside the API process;
-- Redis backend stores jobs durably and workers run jobs outside the API process;
+- Redis backend stores jobs durably, but Telegram jobs are executed by the API owner process;
+- do not run separate Telegram queue workers for the same sessions; this can open a second `TelegramClient` for the same account;
+- the old `tg-api-zapret worker` command is a guard and exits with an error instead of touching Telegram;
 - Redis jobs support `idempotency_key`, `attempts`, `max_attempts`, `leased_until`, retry, and `dead_letter`;
 - expired Redis leases are requeued until `max_attempts`, then moved to dead-letter state.
+
+Check the centralized queue executor:
+
+```bash
+curl http://127.0.0.1:8080/queue/status \
+  -H 'Authorization: Bearer admin-token'
+```
 
 ## Bot API Compatibility Limits
 

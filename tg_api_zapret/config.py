@@ -122,6 +122,7 @@ class ServiceSettings:
     telegram_default_flood_cooldown_seconds: int = 300
     queue_visibility_timeout_seconds: int = 300
     queue_default_max_attempts: int = 3
+    queue_execute_in_api: bool = True
     keep_accounts_online: bool = True
     online_update_interval_seconds: int = 55
     auto_connect_accounts: list[str] = field(default_factory=list)
@@ -227,6 +228,7 @@ class ServiceSettings:
             queue_default_max_attempts=int(
                 data.get("queue_default_max_attempts", cls.queue_default_max_attempts)
             ),
+            queue_execute_in_api=bool(data.get("queue_execute_in_api", cls.queue_execute_in_api)),
             keep_accounts_online=bool(data.get("keep_accounts_online", cls.keep_accounts_online)),
             online_update_interval_seconds=int(
                 data.get("online_update_interval_seconds", cls.online_update_interval_seconds)
@@ -299,6 +301,7 @@ class ServiceSettings:
             "telegram_default_flood_cooldown_seconds": self.telegram_default_flood_cooldown_seconds,
             "queue_visibility_timeout_seconds": self.queue_visibility_timeout_seconds,
             "queue_default_max_attempts": self.queue_default_max_attempts,
+            "queue_execute_in_api": self.queue_execute_in_api,
             "keep_accounts_online": self.keep_accounts_online,
             "online_update_interval_seconds": self.online_update_interval_seconds,
             "auto_connect_accounts": self.auto_connect_accounts,

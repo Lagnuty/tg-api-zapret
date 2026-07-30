@@ -87,12 +87,16 @@ class ApiState:
         self.online_tasks: dict[str, asyncio.Task[None]] = {}
         self.online_status: dict[str, dict[str, Any]] = {}
         self.reconnect_tasks: dict[str, asyncio.Task[None]] = {}
+        self.queue_worker_task: asyncio.Task[None] | None = None
+        self.queue_worker_status: dict[str, Any] = {}
         self.update_handlers: dict[str, tuple[Any, Any]] = {}
         self.entity_cache: dict[str, dict[str, dict[str, Any]]] = {}
         self.connection_health: dict[str, dict[str, Any]] = {}
 
     async def startup(self) -> None:
         service = self.settings().service
+        if service.queue_execute_in_api and not self.queue.runs_inline:
+            self.start_queue_worker()
         for account in service.auto_connect_accounts:
             try:
                 layer = await self.connect(account)
@@ -145,6 +149,7 @@ class ApiState:
                 await self.stop_online_keepalive(account_name)
             for account_name in list(self.reconnect_tasks):
                 await self.stop_reconnect_loop(account_name)
+            await self.stop_queue_worker()
             for account_name in list(self.update_handlers):
                 await self.stop_passive_update_receiver(account_name)
             for layer in self.layers.values():
@@ -251,6 +256,29 @@ class ApiState:
         if task and not task.done():
             return
         self.reconnect_tasks[account_name] = asyncio.create_task(self._reconnect_loop(account_name))
+
+    def start_queue_worker(self) -> None:
+        task = self.queue_worker_task
+        if task and not task.done():
+            return
+        self.queue_worker_task = asyncio.create_task(run_queue_worker(self))
+        self.queue_worker_status = {
+            "mode": "api_owned",
+            "running": True,
+            "started_ts": int(time.time()),
+        }
+
+    async def stop_queue_worker(self) -> None:
+        task = self.queue_worker_task
+        self.queue_worker_task = None
+        if task:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        if self.queue_worker_status:
+            self.queue_worker_status.update({"running": False, "stopped_ts": int(time.time())})
 
     async def stop_reconnect_loop(self, account: str) -> None:
         account_name = self.resolve_account(account)
@@ -475,6 +503,7 @@ class ServiceSettingsPayload(BaseModel):
     telegram_default_flood_cooldown_seconds: int = Field(default=300, ge=1)
     queue_visibility_timeout_seconds: int = Field(default=300, ge=1)
     queue_default_max_attempts: int = Field(default=3, ge=1)
+    queue_execute_in_api: bool = True
     keep_accounts_online: bool = True
     online_update_interval_seconds: int = Field(default=55, ge=15)
     auto_connect_accounts: list[str] = Field(default_factory=list)
@@ -835,8 +864,9 @@ def create_app(state: ApiState) -> FastAPI:
                     "endpoint": "GET /events",
                 },
                 "queue": {
-                    "description": "Background jobs. Backends: memory, redis. Redis jobs are executed by `tg-api-zapret worker`.",
-                    "endpoints": ["POST /queue/jobs", "GET /queue/jobs/{job_id}"],
+                    "description": "Background jobs. Backends: memory, redis. Telegram jobs are executed by the API owner process.",
+                    "endpoints": ["POST /queue/jobs", "GET /queue/jobs/{job_id}", "GET /queue/status"],
+                    "execution_owner": "api_process",
                 },
                 "python_sdk": {
                     "description": "Python client wrapper around HTTP/JSON-RPC/Queue APIs.",
@@ -1022,6 +1052,17 @@ def create_app(state: ApiState) -> FastAPI:
                 account for account, task in state.reconnect_tasks.items() if not task.done()
             ),
             "passive_receivers": sorted(state.update_handlers),
+            "queue_worker": state.queue_worker_status,
+        }
+
+    @app.get("/queue/status")
+    async def queue_status() -> dict[str, Any]:
+        task = state.queue_worker_task
+        return {
+            "backend_runs_inline": state.queue.runs_inline,
+            "execute_in_api": state.settings().service.queue_execute_in_api,
+            "api_worker_running": bool(task and not task.done()),
+            "worker": state.queue_worker_status,
         }
 
     @app.get("/accounts/health")
@@ -2282,15 +2323,39 @@ async def run_queue_job(state: ApiState, job_id: str, payload: QueueJobPayload) 
 
 async def run_queue_worker(state: ApiState, *, poll_timeout: int = 5) -> None:
     while True:
-        job = await state.queue.reserve_job(timeout=poll_timeout)
-        if job is None:
-            continue
-        payload = QueueJobPayload(
-            kind=job["kind"],
-            account=job.get("account"),
-            payload=job.get("payload") or {},
-        )
-        await run_queue_job(state, job["id"], payload)
+        try:
+            job = await state.queue.reserve_job(timeout=poll_timeout)
+            if job is None:
+                state.queue_worker_status.update(
+                    {"running": True, "last_idle_ts": int(time.time())}
+                )
+                continue
+            state.queue_worker_status.update(
+                {
+                    "running": True,
+                    "last_job_id": job["id"],
+                    "last_job_kind": job.get("kind"),
+                    "last_job_ts": int(time.time()),
+                    "last_error": None,
+                }
+            )
+            payload = QueueJobPayload(
+                kind=job["kind"],
+                account=job.get("account"),
+                payload=job.get("payload") or {},
+            )
+            await run_queue_job(state, job["id"], payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            state.queue_worker_status.update(
+                {
+                    "running": True,
+                    "last_error": str(exc),
+                    "last_error_ts": int(time.time()),
+                }
+            )
+            await asyncio.sleep(1)
 
 
 RPC_METHODS = {
