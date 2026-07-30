@@ -12,7 +12,6 @@ from urllib.parse import urlparse
 OFFICIAL_DESKTOP_API_ID = 2040
 OFFICIAL_DESKTOP_API_HASH = "b18441a1ff607e10a989891a5462e627"
 OFFICIAL_DESKTOP_APP_VERSION = "7.0.6"
-OFFICIAL_DESKTOP_USER_AGENT = f"TelegramDesktop/{OFFICIAL_DESKTOP_APP_VERSION}"
 LANGUAGE_ALIASES = {
     "english": "en",
     "russian": "ru",
@@ -130,7 +129,6 @@ class ClientProfile:
             "device_model": self.device_model,
             "system_version": self.system_version,
             "app_version": self.app_version,
-            "desktop_user_agent": f"TelegramDesktop/{self.app_version}",
             "lang_code": self.lang_code,
             "system_lang_code": self.system_lang_code,
         }
@@ -187,6 +185,10 @@ class ServiceSettings:
     online_update_interval_seconds: int = 300
     online_update_min_interval_seconds: int = 300
     online_update_max_interval_seconds: int = 900
+    activity_idle_min_seconds: int = 120
+    activity_idle_max_seconds: int = 300
+    online_debounce_min_seconds: int = 30
+    online_debounce_max_seconds: int = 60
     auto_connect_accounts: list[str] = field(default_factory=list)
     reconnect_enabled: bool = True
     reconnect_min_delay_seconds: int = 5
@@ -199,6 +201,9 @@ class ServiceSettings:
     connection_health_timeout_seconds: int = 20
     raw_updates_retention_days: int = 7
     flood_errors_retention_days: int = 30
+    state_retention_min_interval_hours: int = 12
+    state_retention_max_interval_hours: int = 24
+    state_vacuum_interval_hours: int = 24
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "ServiceSettings":
@@ -332,6 +337,18 @@ class ServiceSettings:
                     cls.online_update_max_interval_seconds,
                 )
             ),
+            activity_idle_min_seconds=int(
+                data.get("activity_idle_min_seconds", cls.activity_idle_min_seconds)
+            ),
+            activity_idle_max_seconds=int(
+                data.get("activity_idle_max_seconds", cls.activity_idle_max_seconds)
+            ),
+            online_debounce_min_seconds=int(
+                data.get("online_debounce_min_seconds", cls.online_debounce_min_seconds)
+            ),
+            online_debounce_max_seconds=int(
+                data.get("online_debounce_max_seconds", cls.online_debounce_max_seconds)
+            ),
             auto_connect_accounts=[
                 normalize_account_name(item)
                 for item in data.get("auto_connect_accounts", defaults.auto_connect_accounts)
@@ -372,6 +389,21 @@ class ServiceSettings:
             ),
             flood_errors_retention_days=int(
                 data.get("flood_errors_retention_days", cls.flood_errors_retention_days)
+            ),
+            state_retention_min_interval_hours=int(
+                data.get(
+                    "state_retention_min_interval_hours",
+                    cls.state_retention_min_interval_hours,
+                )
+            ),
+            state_retention_max_interval_hours=int(
+                data.get(
+                    "state_retention_max_interval_hours",
+                    cls.state_retention_max_interval_hours,
+                )
+            ),
+            state_vacuum_interval_hours=int(
+                data.get("state_vacuum_interval_hours", cls.state_vacuum_interval_hours)
             ),
         )
 
@@ -424,6 +456,10 @@ class ServiceSettings:
             "online_update_interval_seconds": self.online_update_interval_seconds,
             "online_update_min_interval_seconds": self.online_update_min_interval_seconds,
             "online_update_max_interval_seconds": self.online_update_max_interval_seconds,
+            "activity_idle_min_seconds": self.activity_idle_min_seconds,
+            "activity_idle_max_seconds": self.activity_idle_max_seconds,
+            "online_debounce_min_seconds": self.online_debounce_min_seconds,
+            "online_debounce_max_seconds": self.online_debounce_max_seconds,
             "auto_connect_accounts": self.auto_connect_accounts,
             "reconnect_enabled": self.reconnect_enabled,
             "reconnect_min_delay_seconds": self.reconnect_min_delay_seconds,
@@ -436,6 +472,9 @@ class ServiceSettings:
             "connection_health_timeout_seconds": self.connection_health_timeout_seconds,
             "raw_updates_retention_days": self.raw_updates_retention_days,
             "flood_errors_retention_days": self.flood_errors_retention_days,
+            "state_retention_min_interval_hours": self.state_retention_min_interval_hours,
+            "state_retention_max_interval_hours": self.state_retention_max_interval_hours,
+            "state_vacuum_interval_hours": self.state_vacuum_interval_hours,
         }
 
 

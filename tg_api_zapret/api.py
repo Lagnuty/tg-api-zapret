@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager, contextmanager, suppress
 from contextvars import ContextVar
 from dataclasses import replace
 from datetime import datetime
@@ -13,6 +13,7 @@ from pathlib import Path
 import random
 import sqlite3
 import tempfile
+import threading
 import time
 from typing import Any
 from uuid import uuid4
@@ -34,7 +35,6 @@ from tg_api_zapret.config import (
     AppSettings,
     ClientProfile,
     OFFICIAL_DESKTOP_APP_VERSION,
-    OFFICIAL_DESKTOP_USER_AGENT,
     ServiceSettings,
     TelegramConfig,
     detect_lang_code,
@@ -96,11 +96,14 @@ class ApiState:
         self.bot_update_handlers: dict[str, tuple[Any, Any]] = {}
         self.online_tasks: dict[str, asyncio.Task[None]] = {}
         self.online_status: dict[str, dict[str, Any]] = {}
+        self._is_online: dict[str, bool] = {}
         self.idle_offline_tasks: dict[str, asyncio.Task[None]] = {}
         self.last_user_activity_at: dict[str, float] = {}
         self.last_online_status_at: dict[str, float] = {}
         self.next_online_allowed_at: dict[str, float] = {}
         self.reconnect_tasks: dict[str, asyncio.Task[None]] = {}
+        self.retention_task: asyncio.Task[None] | None = None
+        self.last_state_vacuum_at: float = 0.0
         self.queue_worker_task: asyncio.Task[None] | None = None
         self.queue_worker_status: dict[str, Any] = {}
         self.update_handlers: dict[str, tuple[Any, Any]] = {}
@@ -109,12 +112,14 @@ class ApiState:
         self.account_states: dict[str, dict[str, Any]] = {}
         self.sync_states: dict[str, dict[str, int]] = {}
         self._state_db: sqlite3.Connection | None = None
+        self.state_db_lock = threading.RLock()
 
     async def startup(self) -> None:
         service = self.settings().service
         self.load_entity_cache()
         self.load_sync_states()
         self.prune_state_retention()
+        self.start_retention_loop()
         if service.queue_execute_in_api and not self.queue.runs_inline:
             self.start_queue_worker()
         for account in service.auto_connect_accounts:
@@ -178,6 +183,7 @@ class ApiState:
                 await self.stop_reconnect_loop(account_name)
             for account_name in list(self.idle_offline_tasks):
                 await self.stop_idle_offline_timer(account_name)
+            await self.stop_retention_loop()
             await self.stop_queue_worker()
             for account_name in list(self.update_handlers):
                 await self.stop_passive_update_receiver(account_name)
@@ -242,13 +248,7 @@ class ApiState:
                 await task
             except asyncio.CancelledError:
                 pass
-        layer = self.layers.get(account_name)
-        if layer and await layer.is_authorized():
-            try:
-                client = await layer.authorized_client()
-                await client(functions.account.UpdateStatusRequest(offline=True))
-            except Exception:
-                pass
+        await self.send_account_offline_if_online(account_name)
         self.online_status[account_name] = {
             "account": account_name,
             "keep_online": False,
@@ -266,6 +266,7 @@ class ApiState:
                 if await layer.is_authorized():
                     client = await layer.authorized_client()
                     await client(functions.account.UpdateStatusRequest(offline=False))
+                    self._is_online[account] = True
                     self.online_status[account] = {
                         "account": account,
                         "keep_online": True,
@@ -314,6 +315,31 @@ class ApiState:
                 pass
         if self.queue_worker_status:
             self.queue_worker_status.update({"running": False, "stopped_ts": int(time.time())})
+
+    def start_retention_loop(self) -> None:
+        task = self.retention_task
+        if task and not task.done():
+            return
+        self.retention_task = asyncio.create_task(self._retention_loop())
+
+    async def stop_retention_loop(self) -> None:
+        task = self.retention_task
+        self.retention_task = None
+        if task:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+
+    async def _retention_loop(self) -> None:
+        while True:
+            service = self.settings().service
+            min_hours = max(1, service.state_retention_min_interval_hours)
+            max_hours = max(min_hours, service.state_retention_max_interval_hours)
+            await asyncio.sleep(random.uniform(min_hours * 3600, max_hours * 3600))
+            try:
+                self.prune_state_retention()
+            except Exception:
+                pass
 
     async def stop_reconnect_loop(self, account: str) -> None:
         account_name = self.resolve_account(account)
@@ -466,7 +492,6 @@ class ApiState:
         now = time.monotonic()
         previous_activity = self.last_user_activity_at.get(account_name)
         self.last_user_activity_at[account_name] = now
-        self.schedule_idle_offline(account_name)
         if not send_online:
             return
         layer = await self.require_layer(account_name)
@@ -475,17 +500,26 @@ class ApiState:
         allowed_at = self.next_online_allowed_at.get(account_name, 0.0)
         long_pause = previous_activity is None or now - previous_activity > 300
         if not long_pause and now < allowed_at:
+            if self._is_online.get(account_name):
+                self.schedule_idle_offline(account_name)
             return
         client = await layer.authorized_client()
         await client(functions.account.UpdateStatusRequest(offline=False))
+        self._is_online[account_name] = True
         self.last_online_status_at[account_name] = now
-        self.next_online_allowed_at[account_name] = now + random.uniform(30, 60)
+        service = self.settings().service
+        self.next_online_allowed_at[account_name] = now + random_interval(
+            service.online_debounce_min_seconds,
+            service.online_debounce_max_seconds,
+            floor=1,
+        )
         self.online_status[account_name] = {
             "account": account_name,
             "keep_online": False,
             "activity_online": True,
             "last_update_ts": int(time.time()),
         }
+        self.schedule_idle_offline(account_name)
 
     def schedule_idle_offline(self, account: str) -> None:
         account_name = self.resolve_account(account)
@@ -503,17 +537,20 @@ class ApiState:
                 await task
 
     async def _idle_offline_after(self, account: str) -> None:
-        idle_seconds = random.uniform(120, 300)
+        service = self.settings().service
+        idle_seconds = random_interval(
+            service.activity_idle_min_seconds,
+            service.activity_idle_max_seconds,
+            floor=1,
+        )
         try:
             await asyncio.sleep(idle_seconds)
+            if not self._is_online.get(account):
+                return
             last_activity = self.last_user_activity_at.get(account, 0.0)
             if time.monotonic() - last_activity < idle_seconds:
                 return
-            layer = self.layers.get(account)
-            if not layer or not await layer.is_authorized():
-                return
-            client = await layer.authorized_client()
-            await client(functions.account.UpdateStatusRequest(offline=True))
+            await self.send_account_offline_if_online(account)
             self.online_status[account] = {
                 "account": account,
                 "keep_online": False,
@@ -532,13 +569,29 @@ class ApiState:
                 "idle_offline_error": str(exc),
                 "last_update_ts": int(time.time()),
             }
+        finally:
+            task = self.idle_offline_tasks.get(account)
+            if task is asyncio.current_task():
+                self.idle_offline_tasks.pop(account, None)
+
+    async def send_account_offline_if_online(self, account: str) -> None:
+        account_name = self.resolve_account(account)
+        if not self._is_online.get(account_name):
+            return
+        layer = self.layers.get(account_name)
+        if not layer or not await layer.is_authorized():
+            self._is_online[account_name] = False
+            return
+        client = await layer.authorized_client()
+        await client(functions.account.UpdateStatusRequest(offline=True))
+        self._is_online[account_name] = False
 
     def load_sync_states(self) -> None:
         path = self.state_db_path()
         if not path.exists():
             return
         try:
-            with self.open_state_db() as connection:
+            with self.state_db_context() as connection:
                 rows = connection.execute("select account, pts, date, qts from sync_state").fetchall()
         except sqlite3.Error:
             return
@@ -568,7 +621,7 @@ class ApiState:
     def save_sync_state(self, account: str, state: dict[str, int]) -> None:
         path = self.state_db_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        with self.open_state_db() as connection:
+        with self.state_db_context() as connection:
             self.persist_sync_state(account, state, connection)
 
     def persist_sync_state(
@@ -591,7 +644,7 @@ class ApiState:
         )
 
     def apply_difference(self, account: str, difference: Any) -> None:
-        with self.open_state_db() as connection:
+        with self.state_db_context() as connection:
             self.persist_update_bundle(account, "difference", difference, connection)
             state = getattr(difference, "state", None) or getattr(difference, "intermediate_state", None)
             if state is not None:
@@ -665,7 +718,7 @@ class ApiState:
                 (account, kind, safe_json_dumps(payload), int(time.time())),
             )
             return
-        with self.open_state_db() as connection:
+        with self.state_db_context() as connection:
             connection.execute(
                 """
                 insert into raw_updates(account, kind, payload_json, created_ts)
@@ -685,7 +738,7 @@ class ApiState:
         peer_key = str(serialize_tl(peer_id)) if peer_id is not None else ""
         payload = serialize_tl(message)
         if connection is None:
-            with self.open_state_db() as connection:
+            with self.state_db_context() as connection:
                 self.persist_message(account, message, connection)
             return
         connection.execute(
@@ -703,7 +756,7 @@ class ApiState:
         dialog_id = str(dialog.get("id") or "")
         if not dialog_id:
             return
-        with self.open_state_db() as connection:
+        with self.state_db_context() as connection:
             connection.execute(
                 """
                 insert into dialogs(account, dialog_id, payload_json, updated_ts)
@@ -732,7 +785,7 @@ class ApiState:
             self.entity_cache[account][f"@{username}".lower()] = payload
             self.entity_cache[account][str(username).lower()] = payload
         if connection is None:
-            with self.open_state_db() as connection:
+            with self.state_db_context() as connection:
                 self.persist_entity(account, entity, connection)
             return
         connection.execute(
@@ -764,7 +817,7 @@ class ApiState:
         max_id = int(getattr(update, "max_id", 0) or 0)
         payload = serialize_tl(update)
         if connection is None:
-            with self.open_state_db() as connection:
+            with self.state_db_context() as connection:
                 self.persist_read_state(account, update, connection)
             return
         connection.execute(
@@ -781,7 +834,7 @@ class ApiState:
 
     def persist_read_command(self, account: str, entity: Any, max_id: int, result: Any) -> None:
         payload = {"entity": serialize_tl(entity), "result": serialize_tl(result)}
-        with self.open_state_db() as connection:
+        with self.state_db_context() as connection:
             connection.execute(
                 """
                 insert into read_state(account, peer_key, max_id, payload_json, updated_ts)
@@ -805,7 +858,7 @@ class ApiState:
         if not path.exists():
             return
         try:
-            with self.open_state_db() as connection:
+            with self.state_db_context() as connection:
                 rows = connection.execute("select account, cache_json from entity_cache").fetchall()
         except sqlite3.Error:
             return
@@ -822,7 +875,7 @@ class ApiState:
     def save_entity_cache(self) -> None:
         path = self.state_db_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        with self.open_state_db() as connection:
+        with self.state_db_context() as connection:
             for account, entities in self.entity_cache.items():
                 connection.execute(
                     """
@@ -841,27 +894,42 @@ class ApiState:
     def open_state_db(self) -> sqlite3.Connection:
         path = self.state_db_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        if self._state_db is None:
-            self._state_db = sqlite3.connect(path)
-            self._state_db.execute("pragma journal_mode=wal")
-            self._state_db.execute("pragma busy_timeout=5000")
-            self.ensure_state_schema(self._state_db)
-        return self._state_db
+        with self.state_db_lock:
+            if self._state_db is None:
+                self._state_db = sqlite3.connect(path)
+                self._state_db.execute("pragma journal_mode=wal")
+                self._state_db.execute("pragma busy_timeout=5000")
+                self.ensure_state_schema(self._state_db)
+            return self._state_db
+
+    @contextmanager
+    def state_db_context(self):
+        with self.state_db_lock:
+            connection = self.open_state_db()
+            with connection:
+                yield connection
 
     def close_state_db(self) -> None:
-        if self._state_db is None:
-            return
-        self._state_db.close()
-        self._state_db = None
+        with self.state_db_lock:
+            if self._state_db is None:
+                return
+            self._state_db.close()
+            self._state_db = None
 
     def prune_state_retention(self) -> None:
         service = self.settings().service
         now = int(time.time())
         raw_cutoff = now - max(1, service.raw_updates_retention_days) * 86400
         flood_cutoff = now - max(1, service.flood_errors_retention_days) * 86400
-        with self.open_state_db() as connection:
+        with self.state_db_context() as connection:
             connection.execute("delete from raw_updates where created_ts < ?", (raw_cutoff,))
             connection.execute("delete from flood_errors where created_ts < ?", (flood_cutoff,))
+        vacuum_interval = max(1, service.state_vacuum_interval_hours) * 3600
+        if time.monotonic() - self.last_state_vacuum_at < vacuum_interval:
+            return
+        with self.state_db_lock:
+            self.open_state_db().execute("vacuum")
+            self.last_state_vacuum_at = time.monotonic()
 
     @staticmethod
     def ensure_state_schema(connection: sqlite3.Connection) -> None:
@@ -1028,7 +1096,7 @@ class ApiState:
         telegram_retry_after_seconds: int,
         retry_after_seconds: int,
     ) -> None:
-        with self.open_state_db() as connection:
+        with self.state_db_context() as connection:
             connection.execute(
                 """
                 insert into flood_errors(
@@ -1121,6 +1189,10 @@ class ServiceSettingsPayload(BaseModel):
     online_update_interval_seconds: int = Field(default=300, ge=15)
     online_update_min_interval_seconds: int = Field(default=300, ge=15)
     online_update_max_interval_seconds: int = Field(default=900, ge=15)
+    activity_idle_min_seconds: int = Field(default=120, ge=1)
+    activity_idle_max_seconds: int = Field(default=300, ge=1)
+    online_debounce_min_seconds: int = Field(default=30, ge=1)
+    online_debounce_max_seconds: int = Field(default=60, ge=1)
     auto_connect_accounts: list[str] = Field(default_factory=list)
     reconnect_enabled: bool = True
     reconnect_min_delay_seconds: int = Field(default=5, ge=1)
@@ -1133,6 +1205,9 @@ class ServiceSettingsPayload(BaseModel):
     connection_health_timeout_seconds: int = Field(default=20, ge=1)
     raw_updates_retention_days: int = Field(default=7, ge=1)
     flood_errors_retention_days: int = Field(default=30, ge=1)
+    state_retention_min_interval_hours: int = Field(default=12, ge=1)
+    state_retention_max_interval_hours: int = Field(default=24, ge=1)
+    state_vacuum_interval_hours: int = Field(default=24, ge=1)
 
 
 class SendCodePayload(BaseModel):
@@ -1624,7 +1699,6 @@ def create_app(state: ApiState) -> FastAPI:
         return {
             "proxy_url": mask_url_secret(settings.proxy_url),
             "client_profile": settings.client_profile.to_dict(),
-            "desktop_user_agent": OFFICIAL_DESKTOP_USER_AGENT,
             "service": settings.service.to_dict(),
             "active_account": settings.active_account,
             "accounts": settings.accounts,
@@ -1786,7 +1860,18 @@ def create_app(state: ApiState) -> FastAPI:
         }
 
     @app.post("/accounts/sync/difference")
-    async def run_account_difference(account: str | None = None) -> dict[str, Any]:
+    async def run_account_difference(
+        account: str | None = None,
+        recovery: bool = False,
+    ) -> dict[str, Any]:
+        if not recovery:
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "Manual GetDifference is a recovery endpoint. "
+                    "Call with recovery=true only when repairing local sync state."
+                ),
+            )
         ensure_telegram_rate(state, account, "updates.difference")
         account_name = state.resolve_account(account)
         client = await require_authorized_client(state, account_name)
@@ -1925,7 +2010,6 @@ def create_app(state: ApiState) -> FastAPI:
         account: str | None = None,
     ) -> dict[str, Any]:
         ensure_telegram_rate(state, account, "messages.send")
-        await state.mark_user_activity(account, send_online=True)
         idempotency_key = make_action_idempotency_key(
             state.resolve_account(account),
             "messages.send",
@@ -1933,6 +2017,7 @@ def create_app(state: ApiState) -> FastAPI:
         )
         if idempotency_key and idempotency_key in state.idempotency_results:
             return state.idempotency_results[idempotency_key]
+        await state.mark_user_activity(account, send_online=True)
         layer = await state.require_layer(account)
         message = await retry_telegram_call(
             lambda: layer.send_message(
@@ -2006,7 +2091,6 @@ def create_app(state: ApiState) -> FastAPI:
         account: str | None = None,
     ) -> dict[str, Any]:
         ensure_telegram_rate(state, account, "messages.send")
-        await state.mark_user_activity(account, send_online=True)
         idempotency_key = make_action_idempotency_key(
             state.resolve_account(account),
             "messages.send_username",
@@ -2014,6 +2098,7 @@ def create_app(state: ApiState) -> FastAPI:
         )
         if idempotency_key and idempotency_key in state.idempotency_results:
             return state.idempotency_results[idempotency_key]
+        await state.mark_user_activity(account, send_online=True)
         layer = await state.require_layer(account)
         message = await retry_telegram_call(
             lambda: layer.send_message(

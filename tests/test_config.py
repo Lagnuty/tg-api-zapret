@@ -151,6 +151,10 @@ def test_partial_service_settings_uses_safety_defaults(tmp_path) -> None:
     assert loaded.service.online_update_interval_seconds == 300
     assert loaded.service.online_update_min_interval_seconds == 300
     assert loaded.service.online_update_max_interval_seconds == 900
+    assert loaded.service.activity_idle_min_seconds == 120
+    assert loaded.service.activity_idle_max_seconds == 300
+    assert loaded.service.online_debounce_min_seconds == 30
+    assert loaded.service.online_debounce_max_seconds == 60
     assert loaded.service.auto_connect_accounts == []
     assert loaded.service.reconnect_enabled is True
     assert loaded.service.passive_update_receiver is True
@@ -160,3 +164,6 @@ def test_partial_service_settings_uses_safety_defaults(tmp_path) -> None:
     assert loaded.service.require_connection_health_before_auth is True
     assert loaded.service.raw_updates_retention_days == 7
     assert loaded.service.flood_errors_retention_days == 30
+    assert loaded.service.state_retention_min_interval_hours == 12
+    assert loaded.service.state_retention_max_interval_hours == 24
+    assert loaded.service.state_vacuum_interval_hours == 24
